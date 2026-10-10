@@ -95,3 +95,31 @@ func EncodeFields(fields [][]byte) (Record, error) {
 	}
 	return buf, nil
 }
+
+// DecodeFields is the inverse of EncodeFields. The returned slices alias rec.
+func DecodeFields(rec Record) ([][]byte, error) {
+	if len(rec) < 2 {
+		return nil, ErrBadRecord
+	}
+	n := int(binary.LittleEndian.Uint16(rec))
+	if len(rec) < 2+2*n {
+		return nil, ErrBadRecord
+	}
+	lens := make([]int, n)
+	off := 2
+	sum := 0
+	for i := 0; i < n; i++ {
+		lens[i] = int(binary.LittleEndian.Uint16(rec[off:]))
+		sum += lens[i]
+		off += 2
+	}
+	if len(rec) < off+sum {
+		return nil, ErrBadRecord
+	}
+	out := make([][]byte, n)
+	for i := 0; i < n; i++ {
+		out[i] = rec[off : off+lens[i] : off+lens[i]]
+		off += lens[i]
+	}
+	return out, nil
+}
