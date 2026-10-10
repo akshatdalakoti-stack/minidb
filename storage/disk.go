@@ -198,3 +198,99 @@ func (dm *DiskManager) readAt(id PageID, p *Page) error {
 	}
 	return nil
 }
+
+func (dm *DiskManager) writeAt(id PageID, p *Page) error {
+	p.StampChecksum()
+	n, err := dm.f.WriteAt(p.Data[:], int64(id)*PageSize)
+	dm.stats.writes.Add(1)
+	dm.stats.bytesWrit.Add(int64(n))
+	if err != nil {
+		return fmt.Errorf("storage: write page %s: %w", id, err)
+	}
+	return nil
+}
+
+// ReadPage copies page id from disk into p.
+func (dm *DiskManager) ReadPage(id PageID, p *Page) error {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	if dm.closed {
+		return os.ErrClosed
+	}
+	if id == InvalidPageID || uint32(id) >= dm.numPages {
+		return fmt.Errorf("storage: read page %s: %w", id, ErrInvalidPageID)
+	}
+	return dm.readAt(id, p)
+}
+
+// WritePage writes p to page id. It does not fsync; durability is the caller's
+// decision (see Sync). The WAL protocol above this layer is what makes that
+// safe: a dirty page is only allowed to reach disk after the log records that
+// describe it are already durable.
+func (dm *DiskManager) WritePage(id PageID, p *Page) error {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	if dm.closed {
+		return os.ErrClosed
+	}
+	if id == InvalidPageID || uint32(id) >= dm.numPages {
+		return fmt.Errorf("storage: write page %s: %w", id, ErrInvalidPageID)
+	}
+	return dm.writeAt(id, p)
+}
+
+// AllocatePage returns a page id that is not in use. Freed pages are reused
+// first (they form a linked list threaded through the pages themselves via the
+// header's Next field); otherwise the file is extended by one page.
+//
+// The newly allocated page is written out zeroed with a valid checksum, so a
+// later read of a page that was allocated but never filled in returns an empty
+// page rather than a checksum error.
+func (dm *DiskManager) AllocatePage() (PageID, error) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	if dm.closed {
+		return InvalidPageID, os.ErrClosed
+	}
+	dm.stats.allocs.Add(1)
+
+	if dm.freeHead != InvalidPageID {
+		id := dm.freeHead
+		var p Page
+		if err := dm.readAt(id, &p); err != nil {
+			return InvalidPageID, err
+		}
+		dm.freeHead = p.NextPage()
+		if dm.freeCnt > 0 {
+			dm.freeCnt--
+		}
+		// Popping the free list MUST be durable before the page is reused:
+		// if we crashed with a stale head, the same page could be handed out
+		// twice while it already holds live data. Pushes may be lost safely
+		// (they only leak space), pops may not.
+		if err := dm.writeMetaLocked(); err != nil {
+			return InvalidPageID, err
+		}
+		if err := dm.syncLocked(); err != nil {
+			return InvalidPageID, err
+		}
+		var fresh Page
+		fresh.Reset()
+		if err := dm.writeAt(id, &fresh); err != nil {
+			return InvalidPageID, err
+		}
+		return id, nil
+	}
+
+	id := PageID(dm.numPages)
+	var fresh Page
+	fresh.Reset()
+	fresh.StampChecksum()
+	if _, err := dm.f.WriteAt(fresh.Data[:], int64(id)*PageSize); err != nil {
+		return InvalidPageID, fmt.Errorf("storage: extend file: %w", err)
+	}
+	dm.stats.writes.Add(1)
+	dm.stats.bytesWrit.Add(PageSize)
+	dm.numPages++
+	return id, nil
+}
