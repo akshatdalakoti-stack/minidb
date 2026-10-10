@@ -2,6 +2,8 @@ package storage
 
 import (
 	"bytes"
+	"math/rand"
+	"path/filepath"
 	"testing"
 )
 
@@ -184,5 +186,194 @@ func TestSlottedPageFull(t *testing.T) {
 	}
 	if _, err := p.Insert(bytes.Repeat([]byte("y"), MaxRecordSize+1)); err != ErrRecordTooLarge {
 		t.Fatalf("want ErrRecordTooLarge got %v", err)
+	}
+}
+
+func TestSlottedCompaction(t *testing.T) {
+	var p Page
+	p.InitSlotted(PageTypeHeap)
+	// Fill the page, then delete every other record; the freed bytes must be
+	// reclaimable so that inserts succeed again.
+	rec := bytes.Repeat([]byte("q"), 400)
+	var slots []uint16
+	for {
+		s, err := p.Insert(rec)
+		if err != nil {
+			break
+		}
+		slots = append(slots, s)
+	}
+	for i := 0; i < len(slots); i += 2 {
+		if err := p.Delete(slots[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if p.DeadSpace() == 0 {
+		t.Fatal("expected dead space after deletes")
+	}
+	before := map[uint16][]byte{}
+	for i := 1; i < len(slots); i += 2 {
+		r, err := p.Get(slots[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		before[slots[i]] = append([]byte(nil), r...)
+	}
+	p.Compact()
+	if p.DeadSpace() != 0 {
+		t.Fatalf("compaction left %d dead bytes", p.DeadSpace())
+	}
+	for s, want := range before {
+		got, err := p.Get(s)
+		if err != nil {
+			t.Fatalf("slot %d after compaction: %v", s, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("slot %d changed across compaction", s)
+		}
+	}
+	if _, err := p.Insert(rec); err != nil {
+		t.Fatalf("insert after compaction: %v", err)
+	}
+	if err := p.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSlottedInsertAtForRedo(t *testing.T) {
+	var p Page
+	p.InitSlotted(PageTypeHeap)
+	if err := p.InsertAt(5, []byte("recovered")); err != nil {
+		t.Fatal(err)
+	}
+	if p.NumSlots() != 6 {
+		t.Fatalf("numSlots = %d", p.NumSlots())
+	}
+	for i := uint16(0); i < 5; i++ {
+		if p.SlotOccupied(i) {
+			t.Fatalf("slot %d should be a tombstone", i)
+		}
+	}
+	if got, _ := p.Get(5); string(got) != "recovered" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestSlottedRandomizedAgainstModel(t *testing.T) {
+	// Differential test: the page must behave exactly like a map[slot][]byte.
+	var p Page
+	p.InitSlotted(PageTypeHeap)
+	model := map[uint16][]byte{}
+	rng := rand.New(rand.NewSource(7))
+
+	for i := 0; i < 20000; i++ {
+		switch rng.Intn(4) {
+		case 0, 1: // insert
+			rec := make([]byte, rng.Intn(200))
+			rng.Read(rec)
+			s, err := p.Insert(rec)
+			if err == ErrPageFull {
+				continue
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, exists := model[s]; exists {
+				t.Fatalf("slot %d handed out twice", s)
+			}
+			model[s] = rec
+		case 2: // delete
+			for s := range model {
+				if err := p.Delete(s); err != nil {
+					t.Fatal(err)
+				}
+				delete(model, s)
+				break
+			}
+		case 3: // update
+			for s := range model {
+				rec := make([]byte, rng.Intn(300))
+				rng.Read(rec)
+				if err := p.Update(s, rec); err == nil {
+					model[s] = rec
+				} else if err != ErrPageFull {
+					t.Fatal(err)
+				}
+				break
+			}
+		}
+		if err := p.Validate(); err != nil {
+			t.Fatalf("iteration %d: %v", i, err)
+		}
+	}
+	for s, want := range model {
+		got, err := p.Get(s)
+		if err != nil {
+			t.Fatalf("slot %d: %v", s, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("slot %d mismatch", s)
+		}
+	}
+}
+
+// --- Phase 1: disk manager -------------------------------------------------
+
+func tempDB(t testing.TB) string {
+	t.Helper()
+	return filepath.Join(t.TempDir(), "test.db")
+}
+
+func TestDiskManagerReadWrite(t *testing.T) {
+	path := tempDB(t)
+	dm, err := OpenDiskManager(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dm.NumPages() != 1 {
+		t.Fatalf("fresh db should have just the meta page, got %d", dm.NumPages())
+	}
+
+	id, err := dm.AllocatePage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != 1 {
+		t.Fatalf("first allocation = %v", id)
+	}
+	var p Page
+	p.InitSlotted(PageTypeHeap)
+	if _, err := p.Insert([]byte("durable")); err != nil {
+		t.Fatal(err)
+	}
+	if err := dm.WritePage(id, &p); err != nil {
+		t.Fatal(err)
+	}
+	if err := dm.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen: the data and the page count must survive.
+	dm2, err := OpenDiskManager(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dm2.Close()
+	if dm2.NumPages() != 2 {
+		t.Fatalf("numPages = %d", dm2.NumPages())
+	}
+	var q Page
+	if err := dm2.ReadPage(id, &q); err != nil {
+		t.Fatal(err)
+	}
+	got, err := q.Get(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "durable" {
+		t.Fatalf("got %q", got)
+	}
+	if err := dm2.ReadPage(999, &q); err == nil {
+		t.Fatal("expected error reading out of range page")
 	}
 }
