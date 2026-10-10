@@ -12,6 +12,7 @@ package storage
 import (
 	"errors"
 	"fmt"
+	"hash/crc32"
 )
 
 const (
@@ -80,3 +81,42 @@ func (t PageType) String() string {
 	}
 	return "invalid"
 }
+
+// Common header field offsets.
+//
+//	 0  LSN       uint64  log sequence number of the last update to this page
+//	 8  Type      uint8
+//	 9  Flags     uint8
+//	10  NumSlots  uint16  number of slot entries (slotted pages)
+//	12  FreeEnd   uint16  offset where the record area starts (grows downward)
+//	14  --        uint16  reserved / padding
+//	16  Next      uint32  next page (heap chain / leaf sibling / free list)
+//	20  Prev      uint32  previous page
+//	24  Extra     uint32  page-type specific (B+tree leftmost child, ...)
+//	28  Checksum  uint32  CRC32C over the page with this field zeroed
+const (
+	offLSN      = 0
+	offType     = 8
+	offFlags    = 9
+	offNumSlots = 10
+	offFreeEnd  = 12
+	offNext     = 16
+	offPrev     = 20
+	offExtra    = 24
+	offChecksum = 28
+)
+
+var crcTable = crc32.MakeTable(crc32.Castagnoli)
+
+// Page is a raw, fixed size page buffer. It is deliberately a value type with
+// an inline array: a page never grows, never reallocates, and a buffer pool
+// frame can therefore own its memory for the lifetime of the pool.
+type Page struct {
+	Data [PageSize]byte
+}
+
+// Reset zeroes the page.
+func (p *Page) Reset() { clear(p.Data[:]) }
+
+// Bytes exposes the raw page buffer.
+func (p *Page) Bytes() []byte { return p.Data[:] }
