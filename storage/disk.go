@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"sync"
@@ -119,4 +120,81 @@ func OpenDiskManager(path string) (*DiskManager, error) {
 		return nil, err
 	}
 	return dm, nil
+}
+
+// Path returns the database file path.
+func (dm *DiskManager) Path() string { return dm.path }
+
+func (dm *DiskManager) initMeta() error {
+	var p Page
+	p.Reset()
+	p.SetType(PageTypeMeta)
+	p.SetNextPage(InvalidPageID)
+	p.SetPrevPage(InvalidPageID)
+	binary.LittleEndian.PutUint32(p.Data[offMetaMagic:], metaMagic)
+	binary.LittleEndian.PutUint32(p.Data[offMetaVersion:], metaVersion)
+	binary.LittleEndian.PutUint32(p.Data[offMetaFreeHead:], uint32(InvalidPageID))
+	binary.LittleEndian.PutUint32(p.Data[offMetaCatalog:], uint32(InvalidPageID))
+	binary.LittleEndian.PutUint32(p.Data[offMetaNumPages:], 1)
+	binary.LittleEndian.PutUint64(p.Data[offMetaNextTxn:], 1)
+	dm.numPages = 1
+	dm.nextTxnID = 1
+	if err := dm.writeAt(MetaPageID, &p); err != nil {
+		return err
+	}
+	return dm.syncLocked()
+}
+
+func (dm *DiskManager) loadMeta() error {
+	var p Page
+	if err := dm.readAt(MetaPageID, &p); err != nil {
+		return fmt.Errorf("storage: reading meta page: %w", err)
+	}
+	if got := binary.LittleEndian.Uint32(p.Data[offMetaMagic:]); got != metaMagic {
+		return fmt.Errorf("storage: %s is not a minidb file (magic %#x)", dm.path, got)
+	}
+	if v := binary.LittleEndian.Uint32(p.Data[offMetaVersion:]); v != metaVersion {
+		return fmt.Errorf("storage: unsupported file format version %d", v)
+	}
+	dm.freeHead = PageID(binary.LittleEndian.Uint32(p.Data[offMetaFreeHead:]))
+	dm.freeCnt = binary.LittleEndian.Uint32(p.Data[offMetaFreeCount:])
+	dm.catalogRoot = PageID(binary.LittleEndian.Uint32(p.Data[offMetaCatalog:]))
+	dm.checkpointLS = binary.LittleEndian.Uint64(p.Data[offMetaCheckpoint:])
+	dm.nextTxnID = binary.LittleEndian.Uint64(p.Data[offMetaNextTxn:])
+	if dm.nextTxnID == 0 {
+		dm.nextTxnID = 1
+	}
+	return nil
+}
+
+// writeMetaLocked flushes the in-memory meta fields to page 0.
+func (dm *DiskManager) writeMetaLocked() error {
+	var p Page
+	if err := dm.readAt(MetaPageID, &p); err != nil {
+		return err
+	}
+	binary.LittleEndian.PutUint32(p.Data[offMetaFreeHead:], uint32(dm.freeHead))
+	binary.LittleEndian.PutUint32(p.Data[offMetaFreeCount:], dm.freeCnt)
+	binary.LittleEndian.PutUint32(p.Data[offMetaCatalog:], uint32(dm.catalogRoot))
+	binary.LittleEndian.PutUint32(p.Data[offMetaNumPages:], dm.numPages)
+	binary.LittleEndian.PutUint64(p.Data[offMetaCheckpoint:], dm.checkpointLS)
+	binary.LittleEndian.PutUint64(p.Data[offMetaNextTxn:], dm.nextTxnID)
+	return dm.writeAt(MetaPageID, &p)
+}
+
+// readAt/writeAt are the only two places that touch the file. They stamp and
+// verify the page checksum, so a torn or rotted page can never be handed to a
+// caller as if it were valid data.
+func (dm *DiskManager) readAt(id PageID, p *Page) error {
+	n, err := dm.f.ReadAt(p.Data[:], int64(id)*PageSize)
+	dm.stats.reads.Add(1)
+	dm.stats.bytesRead.Add(int64(n))
+	if err != nil && n != PageSize {
+		return fmt.Errorf("storage: read page %s: %w", id, err)
+	}
+	if err := p.VerifyChecksum(); err != nil {
+		dm.stats.corruption.Add(1)
+		return fmt.Errorf("storage: page %s: %w", id, err)
+	}
+	return nil
 }
