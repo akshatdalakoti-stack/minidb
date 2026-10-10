@@ -10,6 +10,7 @@
 package storage
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -120,3 +121,54 @@ func (p *Page) Reset() { clear(p.Data[:]) }
 
 // Bytes exposes the raw page buffer.
 func (p *Page) Bytes() []byte { return p.Data[:] }
+
+// LSN returns the log sequence number of the most recent log record that
+// describes an update to this page. Recovery compares it against the LSN of a
+// log record to decide whether the update is already reflected on the page.
+func (p *Page) LSN() uint64        { return binary.LittleEndian.Uint64(p.Data[offLSN:]) }
+func (p *Page) SetLSN(l uint64)    { binary.LittleEndian.PutUint64(p.Data[offLSN:], l) }
+func (p *Page) Type() PageType     { return PageType(p.Data[offType]) }
+func (p *Page) SetType(t PageType) { p.Data[offType] = byte(t) }
+func (p *Page) Flags() uint8       { return p.Data[offFlags] }
+func (p *Page) SetFlags(f uint8)   { p.Data[offFlags] = f }
+
+func (p *Page) NumSlots() uint16     { return binary.LittleEndian.Uint16(p.Data[offNumSlots:]) }
+func (p *Page) setNumSlots(n uint16) { binary.LittleEndian.PutUint16(p.Data[offNumSlots:], n) }
+func (p *Page) FreeEnd() uint16      { return binary.LittleEndian.Uint16(p.Data[offFreeEnd:]) }
+func (p *Page) setFreeEnd(n uint16)  { binary.LittleEndian.PutUint16(p.Data[offFreeEnd:], n) }
+
+func (p *Page) NextPage() PageID      { return PageID(binary.LittleEndian.Uint32(p.Data[offNext:])) }
+func (p *Page) SetNextPage(id PageID) { binary.LittleEndian.PutUint32(p.Data[offNext:], uint32(id)) }
+func (p *Page) PrevPage() PageID      { return PageID(binary.LittleEndian.Uint32(p.Data[offPrev:])) }
+func (p *Page) SetPrevPage(id PageID) { binary.LittleEndian.PutUint32(p.Data[offPrev:], uint32(id)) }
+func (p *Page) Extra() uint32         { return binary.LittleEndian.Uint32(p.Data[offExtra:]) }
+func (p *Page) SetExtra(v uint32)     { binary.LittleEndian.PutUint32(p.Data[offExtra:], v) }
+
+// checksum is computed with the checksum field itself treated as zero, so the
+// value can be stamped into the page it covers.
+func (p *Page) computeChecksum() uint32 {
+	h := crc32.New(crcTable)
+	h.Write(p.Data[:offChecksum])
+	var zero [4]byte
+	h.Write(zero[:])
+	h.Write(p.Data[offChecksum+4:])
+	return h.Sum32()
+}
+
+// StampChecksum recomputes and writes the page checksum. The DiskManager calls
+// this immediately before every write.
+func (p *Page) StampChecksum() {
+	binary.LittleEndian.PutUint32(p.Data[offChecksum:], p.computeChecksum())
+}
+
+// VerifyChecksum reports whether the page contents match the stored checksum.
+// A mismatch means either bit rot or a torn write (the OS/disk wrote only part
+// of the 4 KiB page before the machine died). Both are unrecoverable at this
+// layer, so we surface them instead of handing out garbage.
+func (p *Page) VerifyChecksum() error {
+	stored := binary.LittleEndian.Uint32(p.Data[offChecksum:])
+	if stored != p.computeChecksum() {
+		return ErrCorruptPage
+	}
+	return nil
+}
