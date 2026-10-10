@@ -89,3 +89,69 @@ func (p *Page) UsedSpace() int {
 	}
 	return used
 }
+
+// DeadSpace is the number of bytes that Compact would reclaim.
+func (p *Page) DeadSpace() int {
+	live := 0
+	n := p.NumSlots()
+	for i := uint16(0); i < n; i++ {
+		off, ln := p.slot(i)
+		if off == 0 {
+			continue
+		}
+		live += int(ln)
+	}
+	return (PageSize - int(p.FreeEnd())) - live
+}
+
+// SlotOccupied reports whether slot i currently holds a live record.
+func (p *Page) SlotOccupied(i uint16) bool {
+	if i >= p.NumSlots() {
+		return false
+	}
+	off, _ := p.slot(i)
+	return off != 0
+}
+
+// Get returns the record stored in slot i. The returned slice aliases the page
+// buffer: it is valid only while the caller holds the page pinned, and callers
+// that hand the bytes to someone else must copy first.
+func (p *Page) Get(i uint16) (Record, error) {
+	if i >= p.NumSlots() {
+		return nil, ErrInvalidSlot
+	}
+	off, ln := p.slot(i)
+	if off == 0 {
+		return nil, ErrRecordDeleted
+	}
+	if int(off)+int(ln) > PageSize || int(off) < p.slotArrayEnd() {
+		return nil, ErrCorruptPage
+	}
+	return Record(p.Data[off : int(off)+int(ln)]), nil
+}
+
+// Insert stores rec in the first free slot (reusing a tombstone if one exists)
+// and returns that slot number. It returns ErrPageFull if the record does not
+// fit even after compaction.
+func (p *Page) Insert(rec Record) (uint16, error) {
+	if len(rec) > MaxRecordSize {
+		return 0, ErrRecordTooLarge
+	}
+	slot, found := p.freeSlot()
+	need := len(rec)
+	if !found {
+		need += SlotSize
+	}
+	if p.FreeSpace() < need {
+		p.Compact()
+		if p.FreeSpace() < need {
+			return 0, ErrPageFull
+		}
+	}
+	if !found {
+		slot = p.NumSlots()
+		p.setNumSlots(slot + 1)
+	}
+	p.place(slot, rec)
+	return slot, nil
+}
