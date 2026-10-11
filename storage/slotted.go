@@ -241,3 +241,83 @@ func (p *Page) freeSlot() (uint16, bool) {
 // nothing outside the node points at a slot number. InsertShift/DeleteShift
 // give those pages an ordered slot array, where inserting in the middle shifts
 // the 4 byte slot entries (not the records) to make room.
+
+// InsertShift inserts rec at slot i, shifting slots i.. one position right.
+func (p *Page) InsertShift(i uint16, rec Record) error {
+	n := p.NumSlots()
+	if i > n {
+		return ErrInvalidSlot
+	}
+	if len(rec) > MaxRecordSize {
+		return ErrRecordTooLarge
+	}
+	if p.FreeSpace() < len(rec)+SlotSize {
+		p.Compact()
+		if p.FreeSpace() < len(rec)+SlotSize {
+			return ErrPageFull
+		}
+	}
+	// Shift the slot array right by one entry, back to front.
+	copy(p.Data[slotPos(i+1):slotPos(n+1)], p.Data[slotPos(i):slotPos(n)])
+	p.setNumSlots(n + 1)
+	p.place(i, rec)
+	return nil
+}
+
+// DeleteShift removes slot i entirely, shifting slots i+1.. one position left.
+func (p *Page) DeleteShift(i uint16) error {
+	n := p.NumSlots()
+	if i >= n {
+		return ErrInvalidSlot
+	}
+	copy(p.Data[slotPos(i):slotPos(n-1)], p.Data[slotPos(i+1):slotPos(n)])
+	p.setSlot(n-1, 0, 0)
+	p.setNumSlots(n - 1)
+	return nil
+}
+
+// Delete tombstones slot i. The slot itself is kept so record ids stay stable;
+// the bytes are reclaimed on the next Compact.
+func (p *Page) Delete(i uint16) error {
+	if i >= p.NumSlots() {
+		return ErrInvalidSlot
+	}
+	off, _ := p.slot(i)
+	if off == 0 {
+		return ErrRecordDeleted
+	}
+	p.setSlot(i, 0, 0)
+	return nil
+}
+
+// Update replaces the record in slot i.
+//
+//   - shrinking or same size: written in place, the tail becomes dead space
+//   - growing: needs free space for a fresh copy (compacting first if needed);
+//     if the page cannot hold the bigger record, ErrPageFull is returned with
+//     the old value untouched so the caller can relocate the record.
+func (p *Page) Update(i uint16, rec Record) error {
+	if i >= p.NumSlots() {
+		return ErrInvalidSlot
+	}
+	if len(rec) > MaxRecordSize {
+		return ErrRecordTooLarge
+	}
+	off, ln := p.slot(i)
+	if off == 0 {
+		return ErrRecordDeleted
+	}
+	if len(rec) <= int(ln) {
+		copy(p.Data[off:], rec)
+		p.setSlot(i, off, uint16(len(rec)))
+		return nil
+	}
+	if p.FreeSpace() < len(rec) {
+		p.Compact()
+		if p.FreeSpace() < len(rec) {
+			return ErrPageFull
+		}
+	}
+	p.place(i, rec)
+	return nil
+}
