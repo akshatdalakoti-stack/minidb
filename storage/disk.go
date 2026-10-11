@@ -294,3 +294,92 @@ func (dm *DiskManager) AllocatePage() (PageID, error) {
 	dm.numPages++
 	return id, nil
 }
+
+// DeallocatePage returns a page to the free list.
+func (dm *DiskManager) DeallocatePage(id PageID) error {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	if dm.closed {
+		return os.ErrClosed
+	}
+	if id == MetaPageID || uint32(id) >= dm.numPages {
+		return fmt.Errorf("storage: free page %s: %w", id, ErrInvalidPageID)
+	}
+	var p Page
+	p.Reset()
+	p.SetType(PageTypeFree)
+	p.SetNextPage(dm.freeHead)
+	if err := dm.writeAt(id, &p); err != nil {
+		return err
+	}
+	dm.freeHead = id
+	dm.freeCnt++
+	dm.stats.frees.Add(1)
+	return nil
+}
+
+// EnsurePages grows the file so that page id n-1 exists, writing zeroed pages
+// with valid checksums.
+//
+// Recovery needs this: AllocatePage extends the file without fsyncing, so a
+// crash can leave the log referring to pages that the data file no longer has.
+// The log is the truth, so the file is stretched back out to match it.
+func (dm *DiskManager) EnsurePages(n uint32) error {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	if dm.closed {
+		return os.ErrClosed
+	}
+	var fresh Page
+	fresh.Reset()
+	fresh.StampChecksum()
+	for dm.numPages < n {
+		if _, err := dm.f.WriteAt(fresh.Data[:], int64(dm.numPages)*PageSize); err != nil {
+			return fmt.Errorf("storage: extend file to %d pages: %w", n, err)
+		}
+		dm.stats.writes.Add(1)
+		dm.stats.bytesWrit.Add(PageSize)
+		dm.numPages++
+	}
+	return nil
+}
+
+// NumPages is the number of pages currently in the file.
+func (dm *DiskManager) NumPages() uint32 {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	return dm.numPages
+}
+
+// FreeCount is the number of pages on the free list.
+func (dm *DiskManager) FreeCount() uint32 {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	return dm.freeCnt
+}
+
+// CatalogRoot / SetCatalogRoot expose the meta slot the table catalog uses to
+// find itself after a restart.
+func (dm *DiskManager) CatalogRoot() PageID {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	return dm.catalogRoot
+}
+
+func (dm *DiskManager) SetCatalogRoot(id PageID) error {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	dm.catalogRoot = id
+	if err := dm.writeMetaLocked(); err != nil {
+		return err
+	}
+	return dm.syncLocked()
+}
+
+// CheckpointLSN / SetCheckpointLSN record where recovery should start its
+// analysis pass.
+func (dm *DiskManager) CheckpointLSN() uint64 {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	return dm.checkpointLS
+}
