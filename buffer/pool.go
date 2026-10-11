@@ -395,3 +395,91 @@ func (bp *Pool) FlushPage(id storage.PageID) error {
 	bp.mu.Unlock()
 	return err
 }
+
+// FlushAllPages writes every dirty page back. Used by checkpoints and by a
+// clean shutdown.
+func (bp *Pool) FlushAllPages() error {
+	bp.mu.Lock()
+	ids := make([]storage.PageID, 0, len(bp.table))
+	for id, f := range bp.table {
+		if bp.frames[f].dirty {
+			ids = append(ids, id)
+		}
+	}
+	bp.mu.Unlock()
+	for _, id := range ids {
+		if err := bp.FlushPage(id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// PinCount reports the pin count of a resident page (-1 if not resident).
+// Exposed for tests and for the "pinned pages are never evicted" assertion.
+func (bp *Pool) PinCount(id storage.PageID) int {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	f, ok := bp.table[id]
+	if !ok {
+		return -1
+	}
+	return bp.frames[f].pin
+}
+
+// IsResident reports whether a page is currently cached.
+func (bp *Pool) IsResident(id storage.PageID) bool {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	_, ok := bp.table[id]
+	return ok
+}
+
+// IsDirty reports whether a resident page has unflushed changes.
+func (bp *Pool) IsDirty(id storage.PageID) bool {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	f, ok := bp.table[id]
+	return ok && bp.frames[f].dirty
+}
+
+// Stats returns a snapshot of pool activity.
+func (bp *Pool) Stats() PoolStats {
+	bp.mu.Lock()
+	pinned := 0
+	for _, fr := range bp.frames {
+		if fr.pin > 0 {
+			pinned++
+		}
+	}
+	s := PoolStats{
+		Policy:   bp.replacer.Name(),
+		Frames:   len(bp.frames),
+		Resident: len(bp.table),
+		Pinned:   pinned,
+	}
+	bp.mu.Unlock()
+	s.Hits = bp.hits.Load()
+	s.Misses = bp.misses.Load()
+	s.Evictions = bp.evictions.Load()
+	s.Flushes = bp.flushes.Load()
+	s.DirtyEvic = bp.dirtyEvic.Load()
+	return s
+}
+
+// ResetStats zeroes the counters (benchmarks measure a warm pool).
+func (bp *Pool) ResetStats() {
+	bp.hits.Store(0)
+	bp.misses.Store(0)
+	bp.evictions.Store(0)
+	bp.flushes.Store(0)
+	bp.dirtyEvic.Store(0)
+}
+
+// --- Handles ---------------------------------------------------------------
+//
+// A Handle bundles the two things a caller needs to touch a page safely: the
+// pin (so the frame is not stolen) and the content latch (so a concurrent
+// flush cannot copy a half-updated page, and two writers cannot interleave).
+// Upper layers use handles exclusively; the raw FetchPage/UnpinPage API exists
+// because it is the classic textbook interface and the tests exercise it.
