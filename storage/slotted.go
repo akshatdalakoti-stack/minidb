@@ -321,3 +321,70 @@ func (p *Page) Update(i uint16, rec Record) error {
 	p.place(i, rec)
 	return nil
 }
+
+// CanUpdate reports whether Update(i, recLen bytes) would succeed.
+//
+// The write-ahead log needs this: a record is written to the log before it
+// is applied, so an operation that might fail on application must be refused
+// before anything is logged. Otherwise the log would contain a change that
+// recovery cannot replay.
+//
+// The answer depends only on the page's logical contents (which records are
+// live and how big they are), never on their physical arrangement, so it gives
+// the same answer at redo time as it did originally.
+func (p *Page) CanUpdate(i uint16, recLen int) bool {
+	if i >= p.NumSlots() || recLen > MaxRecordSize {
+		return false
+	}
+	off, ln := p.slot(i)
+	if off == 0 {
+		return false
+	}
+	if recLen <= int(ln) {
+		return true
+	}
+	return p.FreeSpace()+p.DeadSpace() >= recLen
+}
+
+// Compact slides every live record to the end of the page, eliminating the
+// holes left by deletes and in-place shrinks. Slot numbers are preserved, so
+// no RID is invalidated - that is the whole point of the indirection.
+func (p *Page) Compact() {
+	var tmp [PageSize]byte
+	end := PageSize
+	n := p.NumSlots()
+	for i := uint16(0); i < n; i++ {
+		off, ln := p.slot(i)
+		if off == 0 {
+			continue
+		}
+		end -= int(ln)
+		copy(tmp[end:], p.Data[off:int(off)+int(ln)])
+		p.setSlot(i, uint16(end), ln)
+	}
+	copy(p.Data[end:], tmp[end:])
+	clear(p.Data[p.slotArrayEnd():end]) // do not leak deleted bytes
+	p.setFreeEnd(uint16(end))
+}
+
+// Validate performs a structural self-check of the slotted layout. Tests use
+// it, and so does the recovery path when a page is read back from disk.
+func (p *Page) Validate() error {
+	n := p.NumSlots()
+	if slotPos(n) > PageSize {
+		return ErrCorruptPage
+	}
+	if int(p.FreeEnd()) > PageSize || int(p.FreeEnd()) < slotPos(n) {
+		return ErrCorruptPage
+	}
+	for i := uint16(0); i < n; i++ {
+		off, ln := p.slot(i)
+		if off == 0 {
+			continue
+		}
+		if int(off) < int(p.FreeEnd()) || int(off)+int(ln) > PageSize {
+			return ErrCorruptPage
+		}
+	}
+	return nil
+}
