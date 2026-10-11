@@ -3,6 +3,7 @@ package storage
 import (
 	"bytes"
 	"math/rand"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -375,5 +376,139 @@ func TestDiskManagerReadWrite(t *testing.T) {
 	}
 	if err := dm2.ReadPage(999, &q); err == nil {
 		t.Fatal("expected error reading out of range page")
+	}
+}
+
+func TestDiskManagerFreeListReuse(t *testing.T) {
+	path := tempDB(t)
+	dm, err := OpenDiskManager(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []PageID
+	for i := 0; i < 5; i++ {
+		id, err := dm.AllocatePage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if err := dm.DeallocatePage(ids[2]); err != nil {
+		t.Fatal(err)
+	}
+	if dm.FreeCount() != 1 {
+		t.Fatalf("freeCount = %d", dm.FreeCount())
+	}
+	reused, err := dm.AllocatePage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reused != ids[2] {
+		t.Fatalf("expected free page %v to be reused, got %v", ids[2], reused)
+	}
+	if dm.NumPages() != 6 {
+		t.Fatalf("file grew unnecessarily: %d pages", dm.NumPages())
+	}
+	if err := dm.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDiskManagerDetectsCorruptPage(t *testing.T) {
+	path := tempDB(t)
+	dm, err := OpenDiskManager(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := dm.AllocatePage()
+	var p Page
+	p.InitSlotted(PageTypeHeap)
+	p.Insert([]byte("important"))
+	if err := dm.WritePage(id, &p); err != nil {
+		t.Fatal(err)
+	}
+	dm.Close()
+
+	// Flip a bit on disk behind the engine's back.
+	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b [1]byte
+	if _, err := f.ReadAt(b[:], int64(id)*PageSize+PageSize-5); err != nil {
+		t.Fatal(err)
+	}
+	b[0] ^= 0xFF
+	if _, err := f.WriteAt(b[:], int64(id)*PageSize+PageSize-5); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	dm2, err := OpenDiskManager(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dm2.Close()
+	var q Page
+	if err := dm2.ReadPage(id, &q); err == nil {
+		t.Fatal("corrupt page was accepted")
+	}
+	if dm2.Stats().Corruption == 0 {
+		t.Fatal("corruption not counted")
+	}
+}
+
+func TestDiskManagerTruncatesPartialTrailingPage(t *testing.T) {
+	path := tempDB(t)
+	dm, err := OpenDiskManager(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dm.AllocatePage()
+	dm.Close()
+
+	// Simulate a crash while the file was being extended.
+	f, _ := os.OpenFile(path, os.O_RDWR, 0o644)
+	f.WriteAt([]byte("half a page"), 2*PageSize)
+	f.Close()
+
+	dm2, err := OpenDiskManager(path)
+	if err != nil {
+		t.Fatalf("open after torn extension: %v", err)
+	}
+	defer dm2.Close()
+	if dm2.NumPages() != 2 {
+		t.Fatalf("numPages = %d, partial page not dropped", dm2.NumPages())
+	}
+}
+
+func BenchmarkDiskWritePage(b *testing.B) {
+	dm, err := OpenDiskManager(tempDB(b))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer dm.Close()
+	id, _ := dm.AllocatePage()
+	var p Page
+	p.InitSlotted(PageTypeHeap)
+	p.Insert(bytes.Repeat([]byte("x"), 100))
+	b.SetBytes(PageSize)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := dm.WritePage(id, &p); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkSlottedInsert(b *testing.B) {
+	rec := bytes.Repeat([]byte("x"), 64)
+	var p Page
+	p.InitSlotted(PageTypeHeap)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := p.Insert(rec); err == ErrPageFull {
+			p.InitSlotted(PageTypeHeap)
+		}
 	}
 }
