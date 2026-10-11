@@ -113,3 +113,97 @@ func (r *LRUReplacer) SetEvictable(f int, ev bool) {
 		r.nEvictable--
 	}
 }
+
+func (r *LRUReplacer) Evict() (int, bool) {
+	for f := r.tail; f != nilFrame; f = r.prev[f] {
+		if r.evictable[f] {
+			r.Remove(f)
+			return f, true
+		}
+	}
+	return 0, false
+}
+
+func (r *LRUReplacer) Remove(f int) {
+	r.unlink(f)
+	if r.evictable[f] {
+		r.evictable[f] = false
+		r.nEvictable--
+	}
+}
+
+func (r *LRUReplacer) Size() int { return r.nEvictable }
+
+// --- Clock -----------------------------------------------------------------
+
+// ClockReplacer is the second chance approximation of LRU: one reference bit
+// per frame and a rotating hand. It trades precision for a hit path that is a
+// single byte store, which is why real systems (and PostgreSQL) use a variant
+// of it rather than a true LRU list.
+type ClockReplacer struct {
+	ref        []bool
+	resident   []bool
+	evictable  []bool
+	hand       int
+	nEvictable int
+}
+
+func NewClockReplacer(n int) *ClockReplacer {
+	return &ClockReplacer{
+		ref:       make([]bool, n),
+		resident:  make([]bool, n),
+		evictable: make([]bool, n),
+	}
+}
+
+func (r *ClockReplacer) Name() string { return "Clock" }
+
+func (r *ClockReplacer) RecordAccess(f int) {
+	r.ref[f] = true
+	r.resident[f] = true
+}
+
+func (r *ClockReplacer) SetEvictable(f int, ev bool) {
+	r.resident[f] = true
+	if r.evictable[f] == ev {
+		return
+	}
+	r.evictable[f] = ev
+	if ev {
+		r.nEvictable++
+	} else {
+		r.nEvictable--
+	}
+}
+
+func (r *ClockReplacer) Evict() (int, bool) {
+	n := len(r.ref)
+	if n == 0 || r.nEvictable == 0 {
+		return 0, false
+	}
+	// Two full sweeps at most: the first clears reference bits, the second is
+	// guaranteed to find a victim among the evictable frames.
+	for i := 0; i < 2*n; i++ {
+		f := r.hand
+		r.hand = (r.hand + 1) % n
+		if !r.resident[f] || !r.evictable[f] {
+			continue
+		}
+		if r.ref[f] {
+			r.ref[f] = false // second chance
+			continue
+		}
+		r.Remove(f)
+		return f, true
+	}
+	return 0, false
+}
+
+func (r *ClockReplacer) Remove(f int) {
+	r.resident[f] = false
+	r.ref[f] = false
+	if r.evictable[f] {
+		r.evictable[f] = false
+		r.nEvictable--
+	}
+}
