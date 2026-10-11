@@ -3,6 +3,7 @@ package buffer
 import (
 	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"minidb/storage"
@@ -321,3 +322,136 @@ func TestClockGivesSecondChance(t *testing.T) {
 		t.Fatalf("re-referenced frame was not spared: victim %d", f)
 	}
 }
+
+func TestPoolWorksWithEveryPolicy(t *testing.T) {
+	for _, mk := range []func(int) Replacer{
+		func(n int) Replacer { return NewLRUReplacer(n) },
+		func(n int) Replacer { return NewClockReplacer(n) },
+		func(n int) Replacer { return NewLRUKReplacer(n, 2) },
+	} {
+		bp, _ := newTestPool(t, 4, mk(4))
+		ids := make([]storage.PageID, 0, 32)
+		want := map[storage.PageID]string{}
+		for i := 0; i < 32; i++ {
+			s := fmt.Sprintf("record-%d", i)
+			id := writePage(t, bp, s)
+			ids = append(ids, id)
+			want[id] = s
+		}
+		for _, id := range ids {
+			if got := readPage(t, bp, id); got != want[id] {
+				t.Fatalf("%s: page %v = %q want %q", bp.Stats().Policy, id, got, want[id])
+			}
+		}
+	}
+}
+
+// --- Phase 10: the pool itself must be concurrency safe --------------------
+
+func TestPoolConcurrentAccess(t *testing.T) {
+	bp, _ := newTestPool(t, 8, nil)
+	const nPages = 40
+	ids := make([]storage.PageID, nPages)
+	for i := range ids {
+		ids[i] = writePage(t, bp, fmt.Sprintf("v0-%d", i))
+	}
+
+	var wg sync.WaitGroup
+	for g := 0; g < 16; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				id := ids[(g*7+i)%nPages]
+				if i%4 == 0 {
+					h, err := bp.FetchWrite(id)
+					if err != nil {
+						t.Errorf("fetch write: %v", err)
+						return
+					}
+					h.MarkDirty()
+					h.Page().SetLSN(uint64(i))
+					h.Release()
+				} else {
+					h, err := bp.FetchRead(id)
+					if err != nil {
+						t.Errorf("fetch read: %v", err)
+						return
+					}
+					if _, err := h.Page().Get(0); err != nil {
+						t.Errorf("get: %v", err)
+					}
+					h.Release()
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	if err := bp.FlushAllPages(); err != nil {
+		t.Fatal(err)
+	}
+	if s := bp.Stats(); s.Pinned != 0 {
+		t.Fatalf("pins leaked: %v", s)
+	}
+}
+
+func TestPoolFlushRacesWithWriters(t *testing.T) {
+	bp, _ := newTestPool(t, 4, nil)
+	id := writePage(t, bp, "start")
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				if err := bp.FlushPage(id); err != nil {
+					t.Errorf("flush: %v", err)
+					return
+				}
+			}
+		}
+	}()
+	for i := 0; i < 500; i++ {
+		h, err := bp.FetchWrite(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.MarkDirty()
+		h.Page().SetLSN(uint64(i))
+		h.Release()
+	}
+	close(stop)
+	wg.Wait()
+}
+
+// --- Benchmarks ------------------------------------------------------------
+
+func benchPool(b *testing.B, frames int, working int) {
+	bp, _ := newTestPool(b, frames, nil)
+	ids := make([]storage.PageID, working)
+	for i := range ids {
+		ids[i] = writePage(b, bp, fmt.Sprintf("bench-%d", i))
+	}
+	bp.ResetStats()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		id := ids[i%working]
+		p, err := bp.FetchPage(id)
+		if err != nil {
+			b.Fatal(err)
+		}
+		_, _ = p.Get(0)
+		bp.UnpinPage(id, false)
+	}
+	b.StopTimer()
+	b.ReportMetric(bp.Stats().HitRatio(), "hit-ratio")
+}
+
+// The two benchmarks the brief asks for: small pool vs large pool over the
+// same working set.
+func BenchmarkPoolSmall(b *testing.B) { benchPool(b, 8, 256) }
+func BenchmarkPoolLarge(b *testing.B) { benchPool(b, 512, 256) }
