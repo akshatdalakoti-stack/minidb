@@ -136,3 +136,75 @@ func NewPool(size int, dm *storage.DiskManager, r Replacer) *Pool {
 	}
 	return bp
 }
+
+// SetLogFlusher installs the WAL hook. It must be called before any page is
+// written back, i.e. right after the WAL is opened.
+func (bp *Pool) SetLogFlusher(f func(lsn uint64) error) {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	bp.flushLog = f
+}
+
+// DiskManager exposes the underlying disk manager (used for allocation stats
+// and by recovery, which needs to know how many pages exist).
+func (bp *Pool) DiskManager() *storage.DiskManager { return bp.dm }
+
+// Size is the number of frames in the pool.
+func (bp *Pool) Size() int { return len(bp.pages) }
+
+// FetchPage pins page id and returns a pointer to its frame. Every successful
+// FetchPage must be paired with exactly one UnpinPage, or the frame leaks and
+// the pool eventually runs out of victims.
+//
+// The returned pointer is only valid until the matching UnpinPage.
+func (bp *Pool) FetchPage(id storage.PageID) (*storage.Page, error) {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	f, err := bp.fetchLocked(id)
+	if err != nil {
+		return nil, err
+	}
+	return &bp.pages[f], nil
+}
+
+func (bp *Pool) fetchLocked(id storage.PageID) (int, error) {
+	if f, ok := bp.table[id]; ok {
+		bp.frames[f].pin++
+		bp.replacer.RecordAccess(f)
+		bp.replacer.SetEvictable(f, false)
+		bp.hits.Add(1)
+		return f, nil
+	}
+	bp.misses.Add(1)
+	f, err := bp.victimLocked()
+	if err != nil {
+		return 0, err
+	}
+	// victimLocked may have released the mutex while waiting for a frame, so
+	// another goroutine could have brought the very page we want into the pool
+	// in the meantime. Re-check before doing a redundant read.
+	if f2, ok := bp.table[id]; ok {
+		bp.releaseFrameLocked(f)
+		bp.frames[f2].pin++
+		bp.replacer.RecordAccess(f2)
+		bp.replacer.SetEvictable(f2, false)
+		return f2, nil
+	}
+	if err := bp.dm.ReadPage(id, &bp.pages[f]); err != nil {
+		bp.releaseFrameLocked(f) // give the frame back
+		return 0, err
+	}
+	bp.frames[f] = frame{pageID: id, pin: 1}
+	bp.table[id] = f
+	bp.replacer.RecordAccess(f)
+	bp.replacer.SetEvictable(f, false)
+	return f, nil
+}
+
+// releaseFrameLocked returns an unused frame to the free list and wakes anyone
+// waiting for one.
+func (bp *Pool) releaseFrameLocked(f int) {
+	bp.frames[f] = frame{pageID: storage.InvalidPageID}
+	bp.freeList = append(bp.freeList, f)
+	bp.cond.Broadcast()
+}
