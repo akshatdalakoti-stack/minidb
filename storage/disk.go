@@ -383,3 +383,89 @@ func (dm *DiskManager) CheckpointLSN() uint64 {
 	defer dm.mu.Unlock()
 	return dm.checkpointLS
 }
+
+func (dm *DiskManager) SetCheckpointLSN(lsn uint64) error {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	dm.checkpointLS = lsn
+	if err := dm.writeMetaLocked(); err != nil {
+		return err
+	}
+	return dm.syncLocked()
+}
+
+// NextTxnID / SetNextTxnID persist the transaction id counter so ids keep
+// increasing across restarts (recovery relies on that ordering).
+func (dm *DiskManager) NextTxnID() uint64 {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	return dm.nextTxnID
+}
+
+func (dm *DiskManager) SetNextTxnID(id uint64) error {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	dm.nextTxnID = id
+	return dm.writeMetaLocked()
+}
+
+// Sync forces every write issued so far to stable storage.
+func (dm *DiskManager) Sync() error {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	if dm.closed {
+		return os.ErrClosed
+	}
+	return dm.syncLocked()
+}
+
+func (dm *DiskManager) syncLocked() error {
+	dm.stats.syncs.Add(1)
+	return dm.f.Sync()
+}
+
+// Close flushes meta, fsyncs and closes the file.
+func (dm *DiskManager) Close() error {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	if dm.closed {
+		return nil
+	}
+	dm.closed = true
+	if err := dm.writeMetaLocked(); err != nil {
+		dm.f.Close()
+		return err
+	}
+	if err := dm.syncLocked(); err != nil {
+		dm.f.Close()
+		return err
+	}
+	return dm.f.Close()
+}
+
+// CloseNoSync drops the file handle without flushing the meta page or issuing
+// an fsync - what happens to a process that is killed. Tests use it to
+// simulate a crash; nothing else should.
+func (dm *DiskManager) CloseNoSync() error {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	if dm.closed {
+		return nil
+	}
+	dm.closed = true
+	return dm.f.Close()
+}
+
+// Stats returns a snapshot of the physical I/O counters.
+func (dm *DiskManager) Stats() Stats {
+	return Stats{
+		Reads:      dm.stats.reads.Load(),
+		Writes:     dm.stats.writes.Load(),
+		Allocs:     dm.stats.allocs.Load(),
+		Frees:      dm.stats.frees.Load(),
+		Syncs:      dm.stats.syncs.Load(),
+		BytesRead:  dm.stats.bytesRead.Load(),
+		BytesWrit:  dm.stats.bytesWrit.Load(),
+		Corruption: dm.stats.corruption.Load(),
+	}
+}
