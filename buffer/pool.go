@@ -303,3 +303,95 @@ func (bp *Pool) UnpinPage(id storage.PageID, dirty bool) error {
 	}
 	return bp.unpinFrameLocked(f, dirty)
 }
+
+func (bp *Pool) unpinFrameLocked(f int, dirty bool) error {
+	if bp.frames[f].pin <= 0 {
+		return ErrOverUnpin
+	}
+	if dirty {
+		bp.frames[f].dirty = true
+		bp.frames[f].seq++
+	}
+	bp.frames[f].pin--
+	if bp.frames[f].pin == 0 {
+		bp.replacer.SetEvictable(f, true)
+		bp.cond.Broadcast() // a frame just became a legal victim
+	}
+	return nil
+}
+
+// NewPage allocates a fresh page on disk and returns it pinned. The page comes
+// back zeroed; the caller decides what to initialize it as.
+func (bp *Pool) NewPage() (storage.PageID, *storage.Page, error) {
+	id, err := bp.dm.AllocatePage()
+	if err != nil {
+		return storage.InvalidPageID, nil, err
+	}
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	f, err := bp.victimLocked()
+	if err != nil {
+		return storage.InvalidPageID, nil, err
+	}
+	bp.pages[f].Reset()
+	bp.frames[f] = frame{pageID: id, pin: 1, dirty: true}
+	bp.table[id] = f
+	bp.replacer.RecordAccess(f)
+	bp.replacer.SetEvictable(f, false)
+	return id, &bp.pages[f], nil
+}
+
+// DeletePage removes a page from the pool and returns it to the disk manager's
+// free list. It fails if anybody still has the page pinned.
+func (bp *Pool) DeletePage(id storage.PageID) error {
+	bp.mu.Lock()
+	if f, ok := bp.table[id]; ok {
+		if bp.frames[f].pin != 0 {
+			bp.mu.Unlock()
+			return ErrPagePinned
+		}
+		delete(bp.table, id)
+		bp.replacer.Remove(f)
+		bp.releaseFrameLocked(f)
+	}
+	bp.mu.Unlock()
+	return bp.dm.DeallocatePage(id)
+}
+
+// FlushPage writes page id back to disk if it is resident, whether or not it
+// is dirty. It never blocks on a frame latch while holding the pool mutex:
+// the page is pinned first, then latched, then copied, which keeps the flush
+// path deadlock free with respect to writers that fetch other pages.
+func (bp *Pool) FlushPage(id storage.PageID) error {
+	bp.mu.Lock()
+	f, ok := bp.table[id]
+	if !ok {
+		bp.mu.Unlock()
+		return nil
+	}
+	bp.frames[f].pin++
+	bp.replacer.SetEvictable(f, false)
+	seq := bp.frames[f].seq
+	bp.mu.Unlock()
+
+	bp.latches[f].RLock()
+	scratch := bp.pages[f] // 4 KiB copy taken under the content latch
+	bp.latches[f].RUnlock()
+
+	var err error
+	if bp.flushLog != nil {
+		err = bp.flushLog(scratch.LSN())
+	}
+	if err == nil {
+		err = bp.dm.WritePage(id, &scratch)
+	}
+
+	bp.mu.Lock()
+	if err == nil && bp.frames[f].pageID == id && bp.frames[f].seq == seq {
+		bp.frames[f].dirty = false
+		bp.flushes.Add(1)
+	}
+	bp.unpinFrameLocked(f, false)
+	bp.mu.Unlock()
+	return err
+}
