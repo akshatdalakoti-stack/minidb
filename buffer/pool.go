@@ -483,3 +483,91 @@ func (bp *Pool) ResetStats() {
 // flush cannot copy a half-updated page, and two writers cannot interleave).
 // Upper layers use handles exclusively; the raw FetchPage/UnpinPage API exists
 // because it is the classic textbook interface and the tests exercise it.
+
+// Handle is a pinned, latched reference to a page.
+type Handle struct {
+	bp       *Pool
+	id       storage.PageID
+	frame    int
+	page     *storage.Page
+	write    bool
+	dirty    bool
+	released bool
+}
+
+// FetchRead pins page id and takes its content latch in shared mode.
+func (bp *Pool) FetchRead(id storage.PageID) (*Handle, error) { return bp.fetchHandle(id, false) }
+
+// FetchWrite pins page id and takes its content latch in exclusive mode.
+func (bp *Pool) FetchWrite(id storage.PageID) (*Handle, error) { return bp.fetchHandle(id, true) }
+
+func (bp *Pool) fetchHandle(id storage.PageID, write bool) (*Handle, error) {
+	bp.mu.Lock()
+	f, err := bp.fetchLocked(id)
+	if err != nil {
+		bp.mu.Unlock()
+		return nil, err
+	}
+	page := &bp.pages[f]
+	bp.mu.Unlock()
+
+	// Never acquire a content latch while holding the pool mutex.
+	if write {
+		bp.latches[f].Lock()
+	} else {
+		bp.latches[f].RLock()
+	}
+	return &Handle{bp: bp, id: id, frame: f, page: page, write: write}, nil
+}
+
+// NewPageWrite allocates a page and returns it pinned and write latched.
+func (bp *Pool) NewPageWrite() (*Handle, error) {
+	id, _, err := bp.NewPage()
+	if err != nil {
+		return nil, err
+	}
+	bp.mu.Lock()
+	f := bp.table[id]
+	page := &bp.pages[f]
+	bp.mu.Unlock()
+	bp.latches[f].Lock()
+	return &Handle{bp: bp, id: id, frame: f, page: page, write: true, dirty: true}, nil
+}
+
+// Page returns the page buffer. Valid until Release.
+func (h *Handle) Page() *storage.Page { return h.page }
+
+// ID returns the page id.
+func (h *Handle) ID() storage.PageID { return h.id }
+
+// MarkDirty records that the page is being modified. Call it before mutating
+// the page, while the write latch is held: FlushPage uses the dirty counter to
+// detect a write that raced with its copy.
+func (h *Handle) MarkDirty() {
+	if !h.write {
+		panic("buffer: MarkDirty on a read handle")
+	}
+	if !h.dirty {
+		h.dirty = true
+		h.bp.mu.Lock()
+		h.bp.frames[h.frame].dirty = true
+		h.bp.frames[h.frame].seq++
+		h.bp.mu.Unlock()
+	}
+}
+
+// Release drops the latch and the pin. Calling it twice is a no-op.
+func (h *Handle) Release() {
+	if h.released {
+		return
+	}
+	h.released = true
+	if h.write {
+		h.bp.latches[h.frame].Unlock()
+	} else {
+		h.bp.latches[h.frame].RUnlock()
+	}
+	h.bp.mu.Lock()
+	h.bp.unpinFrameLocked(h.frame, h.dirty)
+	h.bp.mu.Unlock()
+}
