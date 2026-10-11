@@ -155,3 +155,89 @@ func (p *Page) Insert(rec Record) (uint16, error) {
 	p.place(slot, rec)
 	return slot, nil
 }
+
+// ReserveSlot reports which slot an Insert of a record of the given length
+// would use, compacting the page if that is what it takes to make room. It
+// changes no slot contents, so the caller can log the decision before
+// performing it - which is exactly what the write-ahead log needs, since redo
+// must reproduce the same record id.
+func (p *Page) ReserveSlot(recLen int) (uint16, error) {
+	if recLen > MaxRecordSize {
+		return 0, ErrRecordTooLarge
+	}
+	slot, found := p.freeSlot()
+	need := recLen
+	if !found {
+		need += SlotSize
+		slot = p.NumSlots()
+	}
+	if p.FreeSpace() < need {
+		p.Compact() // pure physical rearrangement: slot numbers are preserved
+		if p.FreeSpace() < need {
+			return 0, ErrPageFull
+		}
+	}
+	return slot, nil
+}
+
+// InsertAt stores rec in a specific slot, growing the slot array if needed.
+// Recovery uses this: a redo must reproduce the exact RID the original
+// operation produced, so the slot number comes from the log record rather than
+// being re-derived.
+func (p *Page) InsertAt(slot uint16, rec Record) error {
+	if len(rec) > MaxRecordSize {
+		return ErrRecordTooLarge
+	}
+	n := p.NumSlots()
+	if slot < n {
+		if off, _ := p.slot(slot); off != 0 {
+			// Slot already live: treat as an overwrite.
+			return p.Update(slot, rec)
+		}
+	}
+	grow := 0
+	if slot >= n {
+		grow = (int(slot) - int(n) + 1) * SlotSize
+	}
+	if p.FreeSpace() < len(rec)+grow {
+		p.Compact()
+		if p.FreeSpace() < len(rec)+grow {
+			return ErrPageFull
+		}
+	}
+	if slot >= n {
+		for i := int(n); i <= int(slot); i++ {
+			p.setSlot(uint16(i), 0, 0) // new slots start life as tombstones
+		}
+		p.setNumSlots(slot + 1)
+	}
+	p.place(slot, rec)
+	return nil
+}
+
+// place copies rec into the record area and points slot at it. The caller must
+// have verified there is room.
+func (p *Page) place(slot uint16, rec Record) {
+	end := p.FreeEnd() - uint16(len(rec))
+	copy(p.Data[end:], rec)
+	p.setFreeEnd(end)
+	p.setSlot(slot, end, uint16(len(rec)))
+}
+
+func (p *Page) freeSlot() (uint16, bool) {
+	n := p.NumSlots()
+	for i := uint16(0); i < n; i++ {
+		if off, ln := p.slot(i); off == 0 && ln == 0 {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// --- ordered pages ---------------------------------------------------------
+//
+// A heap page treats slot numbers as record identity, so a delete leaves a
+// tombstone. A B+tree node needs the opposite: slot order is key order, and
+// nothing outside the node points at a slot number. InsertShift/DeleteShift
+// give those pages an ordered slot array, where inserting in the middle shifts
+// the 4 byte slot entries (not the records) to make room.
