@@ -1,5 +1,7 @@
 package buffer
 
+import "math"
+
 // ---------------------------------------------------------------------------
 // Phase 4: page replacement policies.
 //
@@ -207,3 +209,104 @@ func (r *ClockReplacer) Remove(f int) {
 		r.nEvictable--
 	}
 }
+
+func (r *ClockReplacer) Size() int { return r.nEvictable }
+
+// --- LRU-K -----------------------------------------------------------------
+
+// LRUKReplacer evicts the frame with the largest backward k-distance: the
+// distance to its k-th most recent access. Frames accessed fewer than k times
+// have infinite distance and are evicted first (oldest first among them).
+//
+// Why it exists: plain LRU is fooled by a sequential scan, which touches a
+// huge number of pages exactly once and flushes the genuinely hot working set
+// out of the pool. LRU-K (k=2) keeps a page only if it has been referenced
+// twice, so a scan cannot evict the hot set.
+type LRUKReplacer struct {
+	k          int
+	history    [][]uint64 // per frame, the last k access timestamps (oldest first)
+	resident   []bool
+	evictable  []bool
+	nEvictable int
+	clock      uint64
+}
+
+func NewLRUKReplacer(n, k int) *LRUKReplacer {
+	if k < 1 {
+		k = 1
+	}
+	return &LRUKReplacer{
+		k:         k,
+		history:   make([][]uint64, n),
+		resident:  make([]bool, n),
+		evictable: make([]bool, n),
+	}
+}
+
+func (r *LRUKReplacer) Name() string { return "LRU-K" }
+
+func (r *LRUKReplacer) RecordAccess(f int) {
+	r.clock++
+	r.resident[f] = true
+	h := r.history[f]
+	h = append(h, r.clock)
+	if len(h) > r.k {
+		h = h[len(h)-r.k:]
+	}
+	r.history[f] = h
+}
+
+func (r *LRUKReplacer) SetEvictable(f int, ev bool) {
+	r.resident[f] = true
+	if r.evictable[f] == ev {
+		return
+	}
+	r.evictable[f] = ev
+	if ev {
+		r.nEvictable++
+	} else {
+		r.nEvictable--
+	}
+}
+
+func (r *LRUKReplacer) Evict() (int, bool) {
+	victim := -1
+	var bestDist float64 = -1
+	var bestEarliest uint64 = math.MaxUint64
+
+	for f := range r.history {
+		if !r.resident[f] || !r.evictable[f] {
+			continue
+		}
+		h := r.history[f]
+		var dist float64
+		if len(h) < r.k {
+			dist = math.Inf(1)
+		} else {
+			dist = float64(r.clock - h[0])
+		}
+		earliest := uint64(0)
+		if len(h) > 0 {
+			earliest = h[0]
+		}
+		if dist > bestDist || (dist == bestDist && earliest < bestEarliest) {
+			victim, bestDist, bestEarliest = f, dist, earliest
+		}
+	}
+	if victim < 0 {
+		return 0, false
+	}
+	r.Remove(victim)
+	return victim, true
+}
+
+func (r *LRUKReplacer) Remove(f int) {
+	r.history[f] = nil
+	r.resident[f] = false
+	if r.evictable[f] {
+		r.evictable[f] = false
+		r.nEvictable--
+	}
+}
+
+func (r *LRUKReplacer) Size() int { return r.nEvictable }
