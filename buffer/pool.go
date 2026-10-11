@@ -208,3 +208,98 @@ func (bp *Pool) releaseFrameLocked(f int) {
 	bp.freeList = append(bp.freeList, f)
 	bp.cond.Broadcast()
 }
+
+// victimLocked returns an unused frame, evicting if necessary. The evicted
+// page is written back first if dirty.
+//
+// If every frame is pinned there is no victim to be had right now, but a
+// concurrent caller is probably about to unpin one. Rather than failing a
+// perfectly legal workload (more concurrent readers than frames), we wait on a
+// condition variable until a frame frees up, giving up after WaitTimeout so
+// that a genuine deadlock - every frame pinned by a caller that is itself
+// waiting for a frame - surfaces as an error instead of hanging forever.
+func (bp *Pool) victimLocked() (int, error) {
+	deadline := time.Now().Add(bp.waitTimeout)
+	for {
+		f, ok, err := bp.tryVictimLocked()
+		if err != nil {
+			return 0, err
+		}
+		if ok {
+			return f, nil
+		}
+		remaining := time.Until(deadline)
+		if bp.waitTimeout <= 0 || remaining <= 0 {
+			return 0, ErrNoFreeFrame
+		}
+		// cond.Wait has no deadline of its own, so arrange a wake-up call.
+		t := time.AfterFunc(remaining, func() {
+			bp.mu.Lock()
+			bp.cond.Broadcast()
+			bp.mu.Unlock()
+		})
+		bp.waiters++
+		bp.cond.Wait() // releases bp.mu while blocked
+		bp.waiters--
+		t.Stop()
+	}
+}
+
+func (bp *Pool) tryVictimLocked() (int, bool, error) {
+	if n := len(bp.freeList); n > 0 {
+		f := bp.freeList[n-1]
+		bp.freeList = bp.freeList[:n-1]
+		return f, true, nil
+	}
+	f, ok := bp.replacer.Evict()
+	if !ok {
+		return 0, false, nil
+	}
+	old := bp.frames[f]
+	// Pin count must be zero here: the replacer is only ever told a frame is
+	// evictable when its pin count drops to zero, which also means nobody can
+	// be holding its content latch.
+	if old.pin != 0 {
+		return 0, false, fmt.Errorf("buffer: internal error, evicted pinned frame %d", f)
+	}
+	if old.dirty {
+		if err := bp.writeFrameLocked(f); err != nil {
+			return 0, false, err
+		}
+		bp.dirtyEvic.Add(1)
+	}
+	delete(bp.table, old.pageID)
+	bp.evictions.Add(1)
+	bp.frames[f] = frame{pageID: storage.InvalidPageID}
+	return f, true, nil
+}
+
+// writeFrameLocked writes frame f back to disk, honouring the WAL rule.
+// Called with bp.mu held and with the frame guaranteed not to be mutating
+// (either pin==0, or the caller holds the frame latch).
+func (bp *Pool) writeFrameLocked(f int) error {
+	id := bp.frames[f].pageID
+	if bp.flushLog != nil {
+		if err := bp.flushLog(bp.pages[f].LSN()); err != nil {
+			return fmt.Errorf("buffer: WAL flush before page write: %w", err)
+		}
+	}
+	if err := bp.dm.WritePage(id, &bp.pages[f]); err != nil {
+		return err
+	}
+	bp.frames[f].dirty = false
+	bp.flushes.Add(1)
+	return nil
+}
+
+// UnpinPage releases one pin on page id. dirty says whether the caller
+// modified the page; dirtiness is sticky (any dirty unpin marks the frame).
+func (bp *Pool) UnpinPage(id storage.PageID, dirty bool) error {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+	f, ok := bp.table[id]
+	if !ok {
+		return ErrPageNotInUse
+	}
+	return bp.unpinFrameLocked(f, dirty)
+}
