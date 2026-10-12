@@ -194,3 +194,83 @@ func (c Ctx) setHeader(h *buffer.Handle, field uint8, old, new uint32) error {
 	}
 	return c.emit(h, r, func() error { return wal.Redo(h.Page(), r) })
 }
+
+// NewPage allocates a page, logs the allocation, and returns it write latched
+// and initialized as an empty slotted page of the given type.
+func (c Ctx) NewPage(t storage.PageType) (*buffer.Handle, error) {
+	h, err := c.Pool.NewPageWrite()
+	if err != nil {
+		return nil, err
+	}
+	if err := c.InitPage(h, t); err != nil {
+		h.Release()
+		return nil, err
+	}
+	return h, nil
+}
+
+// LogIndexOp records a logical index change: "key -> rid was added to (or
+// removed from) the index rooted at meta".
+//
+// Physical B+tree page changes are logged too (as redo-only records), but they
+// cannot be used for undo: by the time a transaction rolls back, a concurrent
+// split may have moved the entry to another page, so the physical location in
+// the log is stale. Undo therefore re-executes the inverse operation against
+// the tree, which is what this record describes.
+func (c Ctx) LogIndexOp(t wal.Type, meta storage.PageID, key []byte, rid storage.RID) error {
+	var ridBuf [storage.RIDSize]byte
+	storage.EncodeRID(ridBuf[:], rid)
+	r := &wal.Record{
+		Type:    t,
+		TxnID:   c.txnID(),
+		PrevLSN: c.prevLSN(),
+		PageID:  meta,
+		Before:  append([]byte(nil), key...),
+		After:   ridBuf[:],
+	}
+	lsn, err := c.Log.Append(r)
+	if err != nil {
+		return err
+	}
+	if c.Txn != nil {
+		c.Txn.SetLastLSN(lsn)
+	}
+	return nil
+}
+
+// ApplyCLR writes a compensation log record and applies it. Rollback and
+// recovery's undo pass both go through here, so a crash in the middle of a
+// rollback simply resumes where it left off: the CLR is already in the log,
+// and its UndoNext says what still has to be undone.
+func (c Ctx) ApplyCLR(h *buffer.Handle, orig *wal.Record, undoNext wal.LSN) error {
+	op, image := wal.UndoOpFor(orig)
+	clr := &wal.Record{
+		Type:     wal.TypeCLR,
+		Op:       uint8(op),
+		Op2:      orig.Op,
+		TxnID:    orig.TxnID,
+		PrevLSN:  c.prevLSN(),
+		UndoNext: undoNext,
+		Slot:     orig.Slot,
+		After:    image,
+		// A CLR is never undone, and it must reproduce the ordered-page
+		// shifting behaviour of the record it compensates.
+		Flags: wal.FlagRedoOnly | (orig.Flags & wal.FlagShift),
+	}
+	return c.emit(h, clr, func() error { return wal.Undo(h.Page(), orig) })
+}
+
+// LogTxnRecord appends a bookkeeping record (used by recovery for CLRs of
+// logical index undo, which touch no single page).
+func (c Ctx) LogTxnRecord(r *wal.Record) (wal.LSN, error) {
+	r.TxnID = c.txnID()
+	r.PrevLSN = c.prevLSN()
+	lsn, err := c.Log.Append(r)
+	if err != nil {
+		return wal.InvalidLSN, err
+	}
+	if c.Txn != nil {
+		c.Txn.SetLastLSN(lsn)
+	}
+	return lsn, nil
+}
