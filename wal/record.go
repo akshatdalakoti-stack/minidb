@@ -19,6 +19,11 @@
 package wal
 
 import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"hash/crc32"
+
 	"minidb/storage"
 )
 
@@ -143,3 +148,132 @@ type Record struct {
 	Before   []byte // undo image
 	After    []byte // redo image
 }
+
+func (r *Record) RedoOnly() bool { return r.Flags&FlagRedoOnly != 0 }
+
+func (r *Record) String() string {
+	return fmt.Sprintf("lsn=%d txn=%d prev=%d %s page=%v slot=%d before=%dB after=%dB",
+		r.LSN, r.TxnID, r.PrevLSN, r.Type, r.PageID, r.Slot, len(r.Before), len(r.After))
+}
+
+// On-disk framing: uint32 payload length | payload | uint32 CRC32C of payload.
+const (
+	recHeaderSize = 48 // fixed part of the payload
+	frameOverhead = 8  // length prefix + trailing checksum
+
+	offRecLSN      = 0
+	offRecTxn      = 8
+	offRecPrev     = 16
+	offRecUndoNext = 24
+	offRecType     = 32
+	offRecOp       = 33
+	offRecFlags    = 34
+	offRecOp2      = 35
+	offRecPageID   = 36
+	offRecSlot     = 40
+	offRecBeforeLn = 44
+	offRecAfterLn  = 46
+
+	// MaxRecordSize caps a single log record; a page-sized before and after
+	// image plus the header always fits comfortably.
+	MaxRecordSize = 3 * storage.PageSize
+)
+
+var (
+	// ErrTornRecord means the log ended in the middle of a record, or the
+	// record's checksum does not match. Either way it is the tail of a log
+	// that was being written when the machine died: recovery stops there.
+	ErrTornRecord = errors.New("wal: torn or corrupt log record")
+	ErrTooLarge   = errors.New("wal: log record too large")
+)
+
+var crcTable = crc32.MakeTable(crc32.Castagnoli)
+
+// EncodedSize is the number of bytes the record occupies in the log.
+func (r *Record) EncodedSize() int {
+	return frameOverhead + recHeaderSize + len(r.Before) + len(r.After)
+}
+
+// AppendTo serializes the record onto dst.
+func (r *Record) AppendTo(dst []byte) ([]byte, error) {
+	if len(r.Before) > 0xFFFF || len(r.After) > 0xFFFF {
+		return nil, ErrTooLarge
+	}
+	payloadLen := recHeaderSize + len(r.Before) + len(r.After)
+	if payloadLen+frameOverhead > MaxRecordSize {
+		return nil, ErrTooLarge
+	}
+	var lenBuf [4]byte
+	binary.LittleEndian.PutUint32(lenBuf[:], uint32(payloadLen))
+	dst = append(dst, lenBuf[:]...)
+
+	start := len(dst)
+	dst = append(dst, make([]byte, recHeaderSize)...)
+	h := dst[start:]
+	binary.LittleEndian.PutUint64(h[offRecLSN:], r.LSN)
+	binary.LittleEndian.PutUint64(h[offRecTxn:], r.TxnID)
+	binary.LittleEndian.PutUint64(h[offRecPrev:], r.PrevLSN)
+	binary.LittleEndian.PutUint64(h[offRecUndoNext:], r.UndoNext)
+	h[offRecType] = byte(r.Type)
+	h[offRecOp] = r.Op
+	h[offRecFlags] = r.Flags
+	h[offRecOp2] = r.Op2
+	binary.LittleEndian.PutUint32(h[offRecPageID:], uint32(r.PageID))
+	binary.LittleEndian.PutUint16(h[offRecSlot:], r.Slot)
+	binary.LittleEndian.PutUint16(h[offRecBeforeLn:], uint16(len(r.Before)))
+	binary.LittleEndian.PutUint16(h[offRecAfterLn:], uint16(len(r.After)))
+	dst = append(dst, r.Before...)
+	dst = append(dst, r.After...)
+
+	crc := crc32.Checksum(dst[start:], crcTable)
+	var crcBuf [4]byte
+	binary.LittleEndian.PutUint32(crcBuf[:], crc)
+	return append(dst, crcBuf[:]...), nil
+}
+
+// DecodeRecord parses one record from buf, which must start at a record
+// boundary. It returns the record and the number of bytes consumed.
+func DecodeRecord(buf []byte) (*Record, int, error) {
+	if len(buf) < 4 {
+		return nil, 0, ErrTornRecord
+	}
+	payloadLen := int(binary.LittleEndian.Uint32(buf))
+	if payloadLen < recHeaderSize || payloadLen+frameOverhead > MaxRecordSize {
+		return nil, 0, ErrTornRecord
+	}
+	total := payloadLen + frameOverhead
+	if len(buf) < total {
+		return nil, 0, ErrTornRecord
+	}
+	payload := buf[4 : 4+payloadLen]
+	want := binary.LittleEndian.Uint32(buf[4+payloadLen:])
+	if crc32.Checksum(payload, crcTable) != want {
+		return nil, 0, ErrTornRecord
+	}
+	r := &Record{
+		LSN:      binary.LittleEndian.Uint64(payload[offRecLSN:]),
+		TxnID:    binary.LittleEndian.Uint64(payload[offRecTxn:]),
+		PrevLSN:  binary.LittleEndian.Uint64(payload[offRecPrev:]),
+		UndoNext: binary.LittleEndian.Uint64(payload[offRecUndoNext:]),
+		Type:     Type(payload[offRecType]),
+		Op:       payload[offRecOp],
+		Op2:      payload[offRecOp2],
+		Flags:    payload[offRecFlags],
+		PageID:   storage.PageID(binary.LittleEndian.Uint32(payload[offRecPageID:])),
+		Slot:     binary.LittleEndian.Uint16(payload[offRecSlot:]),
+	}
+	bl := int(binary.LittleEndian.Uint16(payload[offRecBeforeLn:]))
+	al := int(binary.LittleEndian.Uint16(payload[offRecAfterLn:]))
+	if recHeaderSize+bl+al != payloadLen {
+		return nil, 0, ErrTornRecord
+	}
+	if bl > 0 {
+		r.Before = append([]byte(nil), payload[recHeaderSize:recHeaderSize+bl]...)
+	}
+	if al > 0 {
+		r.After = append([]byte(nil), payload[recHeaderSize+bl:recHeaderSize+bl+al]...)
+	}
+	return r, total, nil
+}
+
+// --- applying a record to a page ------------------------------------------
