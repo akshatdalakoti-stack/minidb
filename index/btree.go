@@ -618,3 +618,73 @@ func (t *Tree) splitLeaf(ctx pageops.Ctx, h *buffer.Handle, idx uint16, entry []
 	sep := append([]byte(nil), entries[cut]...)
 	return sep, rightH.ID(), nil
 }
+
+// splitInternal splits a full internal node. Unlike a leaf split, the middle
+// key moves up rather than being copied: it is a separator, not data.
+func (t *Tree) splitInternal(ctx pageops.Ctx, h *buffer.Handle, idx uint16, entry []byte) ([]byte, storage.PageID, error) {
+	p := h.Page()
+	entries, err := collectEntries(p)
+	if err != nil {
+		return nil, storage.InvalidPageID, err
+	}
+	entries = append(entries, nil)
+	copy(entries[idx+1:], entries[idx:])
+	entries[idx] = entry
+
+	cut := splitPoint(entries)
+	if cut >= len(entries) {
+		cut = len(entries) - 1
+	}
+	promoted := entries[cut] // moves up
+	rightH, err := ctx.NewPage(storage.PageTypeBTreeInternal)
+	if err != nil {
+		return nil, storage.InvalidPageID, err
+	}
+	defer rightH.Release()
+
+	// The promoted entry's child becomes the right node's leftmost child.
+	if err := ctx.SetExtra(rightH, uint32(internalChild(promoted))); err != nil {
+		return nil, storage.InvalidPageID, err
+	}
+	for i, e := range entries[cut+1:] {
+		if err := ctx.InsertShift(rightH, uint16(i), e); err != nil {
+			return nil, storage.InvalidPageID, err
+		}
+	}
+	if err := t.trimLeft(ctx, h, keepCount(cut, idx)); err != nil {
+		return nil, storage.InvalidPageID, err
+	}
+	if int(idx) < cut {
+		if err := ctx.InsertShift(h, idx, entry); err != nil {
+			return nil, storage.InvalidPageID, err
+		}
+	}
+	sep := append([]byte(nil), internalKey(promoted)...)
+	return sep, rightH.ID(), nil
+}
+
+// --- delete ----------------------------------------------------------------
+
+// Delete removes key -> rid. It reports whether the entry was there.
+func (t *Tree) Delete(ctx pageops.Ctx, key []byte, rid storage.RID) (bool, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	root, err := t.rootID()
+	if err != nil {
+		return false, err
+	}
+	// Log the logical operation before touching anything, so an abort can put
+	// the entry back.
+	if ctx.Log != nil {
+		if err := ctx.LogIndexOp(wal.TypeIdxDelete, t.meta, key, rid); err != nil {
+			return false, err
+		}
+	}
+	sctx := ctx.Structural()
+	found, err := t.deleteFrom(sctx, root, key, rid)
+	if err != nil || !found {
+		return found, err
+	}
+	return true, t.shrinkRoot(sctx)
+}
