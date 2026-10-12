@@ -34,6 +34,7 @@
 package index
 
 import (
+	"bytes"
 	"errors"
 	"sync"
 
@@ -146,3 +147,110 @@ func internalEntry(key []byte, child storage.PageID) []byte {
 	e[len(key)+3] = byte(child >> 24)
 	return e
 }
+
+// internalKey is the separator stored in an internal entry. Separators are
+// composite keys - the whole leaf entry, key||RID - not bare keys. With
+// duplicate keys a bare separator is ambiguous: several leaves can hold the
+// same key, and a descent comparing bare keys lands on an arbitrary one of
+// them. Including the RID makes the ordering total, so "the leaf where this
+// exact entry belongs" is always well defined.
+func internalKey(e []byte) []byte { return e[:len(e)-childSize] }
+
+// lowKey is the smallest composite key for a given user key: RID (page 0,
+// slot 0) never identifies a real record, because page 0 is the meta page.
+// Descending with it lands on the leftmost leaf that can hold the key.
+func lowKey(key []byte) []byte { return leafEntry(key, storage.RID{}) }
+func internalChild(e []byte) storage.PageID {
+	b := e[len(e)-childSize:]
+	return storage.PageID(uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24)
+}
+
+func isLeaf(p *storage.Page) bool { return p.Type() == storage.PageTypeBTreeLeaf }
+
+// --- searching within a node ----------------------------------------------
+
+// leafSearch finds where (key, rid) belongs in a leaf. Entries are ordered by
+// key and then by RID, so duplicate keys are supported: an index on a
+// non-unique column simply holds several entries with the same key.
+func leafSearch(p *storage.Page, key []byte, rid storage.RID) (idx uint16, found bool, err error) {
+	lo, hi := 0, int(p.NumSlots())
+	for lo < hi {
+		mid := (lo + hi) / 2
+		e, err := p.Get(uint16(mid))
+		if err != nil {
+			return 0, false, err
+		}
+		c := bytes.Compare(leafKey(e), key)
+		if c == 0 {
+			c = leafRID(e).Compare(rid)
+		}
+		switch {
+		case c < 0:
+			lo = mid + 1
+		case c > 0:
+			hi = mid
+		default:
+			return uint16(mid), true, nil
+		}
+	}
+	return uint16(lo), false, nil
+}
+
+// leafLowerBound finds the first entry with key >= the search key.
+func leafLowerBound(p *storage.Page, key []byte) (uint16, error) {
+	lo, hi := 0, int(p.NumSlots())
+	for lo < hi {
+		mid := (lo + hi) / 2
+		e, err := p.Get(uint16(mid))
+		if err != nil {
+			return 0, err
+		}
+		if bytes.Compare(leafKey(e), key) < 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return uint16(lo), nil
+}
+
+// childFor returns the child of an internal node that a key belongs under, and
+// the slot index of that child (-1 meaning the leftmost child in Extra).
+func childFor(p *storage.Page, key []byte) (storage.PageID, int, error) {
+	lo, hi := 0, int(p.NumSlots())
+	for lo < hi {
+		mid := (lo + hi) / 2
+		e, err := p.Get(uint16(mid))
+		if err != nil {
+			return storage.InvalidPageID, 0, err
+		}
+		if bytes.Compare(internalKey(e), key) <= 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	idx := lo - 1
+	if idx < 0 {
+		return storage.PageID(p.Extra()), -1, nil
+	}
+	e, err := p.Get(uint16(idx))
+	if err != nil {
+		return storage.InvalidPageID, 0, err
+	}
+	return internalChild(e), idx, nil
+}
+
+// childAt returns the child pointer at a given index (-1 = Extra).
+func childAt(p *storage.Page, idx int) (storage.PageID, error) {
+	if idx < 0 {
+		return storage.PageID(p.Extra()), nil
+	}
+	e, err := p.Get(uint16(idx))
+	if err != nil {
+		return storage.InvalidPageID, err
+	}
+	return internalChild(e), nil
+}
+
+// --- search ----------------------------------------------------------------
