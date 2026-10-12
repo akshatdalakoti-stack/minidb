@@ -192,3 +192,133 @@ func (m *Manager) writeBufferLocked() error {
 	m.buf = m.buf[:0]
 	return nil
 }
+
+// Flush makes every record with LSN < upto durable. Passing 0 flushes
+// everything appended so far.
+//
+// This is the function the buffer pool calls before writing a dirty page, and
+// the function a committing transaction calls before it reports success.
+func (m *Manager) Flush(upto LSN) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.flushLocked(upto)
+}
+
+func (m *Manager) flushLocked(upto LSN) error {
+	if m.closed {
+		return os.ErrClosed
+	}
+	if upto == 0 {
+		upto = m.nextLSN
+	}
+	if upto <= m.flushed {
+		return nil // already durable; the common case, and it costs nothing
+	}
+	if err := m.writeBufferLocked(); err != nil {
+		return err
+	}
+	if !m.noSync {
+		if err := m.f.Sync(); err != nil {
+			return fmt.Errorf("wal: fsync log: %w", err)
+		}
+		m.syncs.Add(1)
+	}
+	m.flushed = m.nextLSN
+	m.flushes.Add(1)
+	return nil
+}
+
+// FlushedLSN is the highest LSN guaranteed to be on stable storage.
+func (m *Manager) FlushedLSN() LSN {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.flushed
+}
+
+// NextLSN is where the next appended record will go (i.e. the end of the log).
+func (m *Manager) NextLSN() LSN {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.nextLSN
+}
+
+// Read returns the record at a given LSN. Rollback uses it to walk a
+// transaction's PrevLSN chain backwards.
+func (m *Manager) Read(lsn LSN) (*Record, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if lsn < logHeaderSize || lsn >= m.nextLSN {
+		return nil, fmt.Errorf("wal: LSN %d out of range", lsn)
+	}
+	if err := m.writeBufferLocked(); err != nil {
+		return nil, err
+	}
+	var lenBuf [4]byte
+	if _, err := m.f.ReadAt(lenBuf[:], int64(lsn)); err != nil {
+		return nil, err
+	}
+	total := int(binary.LittleEndian.Uint32(lenBuf[:])) + frameOverhead
+	if total <= frameOverhead || total > MaxRecordSize {
+		return nil, ErrTornRecord
+	}
+	buf := make([]byte, total)
+	if _, err := m.f.ReadAt(buf, int64(lsn)); err != nil {
+		return nil, err
+	}
+	rec, _, err := DecodeRecord(buf)
+	return rec, err
+}
+
+// Scan calls fn for every record from `from` to the end of the log, in order.
+// Returning a non-nil error from fn stops the scan.
+func (m *Manager) Scan(from LSN, fn func(*Record) error) error {
+	m.mu.Lock()
+	if err := m.writeBufferLocked(); err != nil {
+		m.mu.Unlock()
+		return err
+	}
+	end := int64(m.nextLSN)
+	m.mu.Unlock()
+
+	if from < logHeaderSize {
+		from = logHeaderSize
+	}
+	off := int64(from)
+	buf := make([]byte, 0, 256*1024)
+	for off < end {
+		want := end - off
+		if want > int64(cap(buf)) {
+			want = int64(cap(buf))
+		}
+		buf = buf[:want]
+		if _, err := m.f.ReadAt(buf, off); err != nil && err != io.EOF {
+			return err
+		}
+		consumed := 0
+		for {
+			rec, sz, err := DecodeRecord(buf[consumed:])
+			if err != nil {
+				if consumed == 0 {
+					if int64(len(buf)) >= end-off {
+						return fmt.Errorf("wal: scan at offset %d: %w", off, err)
+					}
+					buf = make([]byte, 0, cap(buf)*2) // record straddles the chunk
+					consumed = -1
+				}
+				break
+			}
+			if err := fn(rec); err != nil {
+				return err
+			}
+			consumed += sz
+			if consumed >= len(buf) {
+				break
+			}
+		}
+		if consumed < 0 {
+			continue
+		}
+		off += int64(consumed)
+	}
+	return nil
+}
