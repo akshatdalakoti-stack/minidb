@@ -254,3 +254,110 @@ func childAt(p *storage.Page, idx int) (storage.PageID, error) {
 }
 
 // --- search ----------------------------------------------------------------
+
+// Search returns every RID stored under key.
+func (t *Tree) Search(key []byte) ([]storage.RID, error) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	leafID, err := t.findLeaf(lowKey(key))
+	if err != nil {
+		return nil, err
+	}
+	var out []storage.RID
+	for leafID != storage.InvalidPageID {
+		h, err := t.pool.FetchRead(leafID)
+		if err != nil {
+			return nil, err
+		}
+		p := h.Page()
+		idx, err := leafLowerBound(p, key)
+		if err != nil {
+			h.Release()
+			return nil, err
+		}
+		done := false
+		for i := idx; i < p.NumSlots(); i++ {
+			e, err := p.Get(i)
+			if err != nil {
+				h.Release()
+				return nil, err
+			}
+			if !bytes.Equal(leafKey(e), key) {
+				done = true
+				break
+			}
+			out = append(out, leafRID(e))
+		}
+		next := p.NextPage()
+		h.Release()
+		if done {
+			break
+		}
+		// The matching entries may continue into the next leaf.
+		leafID = next
+	}
+	return out, nil
+}
+
+// findLeaf descends from the root to the leaf that would contain the given
+// composite key (key||RID - see internalKey).
+func (t *Tree) findLeaf(ckey []byte) (storage.PageID, error) {
+	pid, err := t.rootID()
+	if err != nil {
+		return storage.InvalidPageID, err
+	}
+	for depth := 0; ; depth++ {
+		if depth > 64 {
+			return storage.InvalidPageID, ErrCorruptTree
+		}
+		h, err := t.pool.FetchRead(pid)
+		if err != nil {
+			return storage.InvalidPageID, err
+		}
+		p := h.Page()
+		if isLeaf(p) {
+			h.Release()
+			return pid, nil
+		}
+		child, _, err := childFor(p, ckey)
+		h.Release()
+		if err != nil {
+			return storage.InvalidPageID, err
+		}
+		if child == storage.InvalidPageID {
+			return storage.InvalidPageID, ErrCorruptTree
+		}
+		pid = child
+	}
+}
+
+// findLeftmostLeaf descends to the first leaf (used by full scans).
+func (t *Tree) findLeftmostLeaf() (storage.PageID, error) {
+	pid, err := t.rootID()
+	if err != nil {
+		return storage.InvalidPageID, err
+	}
+	for depth := 0; ; depth++ {
+		if depth > 64 {
+			return storage.InvalidPageID, ErrCorruptTree
+		}
+		h, err := t.pool.FetchRead(pid)
+		if err != nil {
+			return storage.InvalidPageID, err
+		}
+		p := h.Page()
+		if isLeaf(p) {
+			h.Release()
+			return pid, nil
+		}
+		child, err := childAt(p, -1)
+		h.Release()
+		if err != nil {
+			return storage.InvalidPageID, err
+		}
+		pid = child
+	}
+}
+
+// --- insert ----------------------------------------------------------------
