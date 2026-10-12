@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"math/rand"
 	"path/filepath"
+	"sort"
 	"testing"
 
 	"minidb/buffer"
@@ -174,5 +175,144 @@ func TestTreeDuplicateKeys(t *testing.T) {
 	}
 	if err := tr.Validate(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestTreeDelete(t *testing.T) {
+	h := newHarness(t, 64)
+	tr := newTree(t, h)
+
+	const n = 5000
+	for i := 0; i < n; i++ {
+		if err := tr.Insert(h.ctx, key(i), rid(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Delete every other key.
+	for i := 0; i < n; i += 2 {
+		ok, err := tr.Delete(h.ctx, key(i), rid(i))
+		if err != nil {
+			t.Fatalf("delete %d: %v", i, err)
+		}
+		if !ok {
+			t.Fatalf("delete %d reported not found", i)
+		}
+	}
+	if err := tr.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < n; i++ {
+		got, err := tr.Search(key(i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := 1
+		if i%2 == 0 {
+			want = 0
+		}
+		if len(got) != want {
+			t.Fatalf("after deletes, key %d has %d entries, want %d", i, len(got), want)
+		}
+	}
+	// Deleting something that is not there is not an error, just false.
+	if ok, err := tr.Delete(h.ctx, key(0), rid(0)); err != nil || ok {
+		t.Fatalf("re-delete: ok=%v err=%v", ok, err)
+	}
+
+	// Now delete the rest: the tree must collapse back towards a single leaf.
+	for i := 1; i < n; i += 2 {
+		if _, err := tr.Delete(h.ctx, key(i), rid(i)); err != nil {
+			t.Fatalf("delete %d: %v", i, err)
+		}
+	}
+	if err := tr.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := tr.Count(); c != 0 {
+		t.Fatalf("tree not empty after deleting everything: %d entries", c)
+	}
+	height, _ := tr.Height()
+	if height != 1 {
+		t.Fatalf("emptied tree still has height %d", height)
+	}
+	// And it still works afterwards.
+	if err := tr.Insert(h.ctx, key(42), rid(42)); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := tr.Search(key(42)); len(got) != 1 {
+		t.Fatal("tree unusable after being emptied")
+	}
+}
+
+func TestTreeRangeScan(t *testing.T) {
+	h := newHarness(t, 64)
+	tr := newTree(t, h)
+
+	const n = 3000
+	for i := 0; i < n; i++ {
+		if err := tr.Insert(h.ctx, key(i), rid(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(start, end []byte, wantFirst, wantLast, wantCount int) {
+		t.Helper()
+		it := tr.Scan(start, end)
+		var keys []int
+		for it.Next() {
+			keys = append(keys, int(binary.BigEndian.Uint64(it.Key())))
+		}
+		if err := it.Err(); err != nil {
+			t.Fatal(err)
+		}
+		if len(keys) != wantCount {
+			t.Fatalf("scan returned %d keys, want %d", len(keys), wantCount)
+		}
+		if wantCount == 0 {
+			return
+		}
+		if keys[0] != wantFirst || keys[len(keys)-1] != wantLast {
+			t.Fatalf("scan range [%d..%d], want [%d..%d]", keys[0], keys[len(keys)-1], wantFirst, wantLast)
+		}
+		if !sort.IntsAreSorted(keys) {
+			t.Fatal("scan results are not in key order")
+		}
+	}
+	check(nil, nil, 0, n-1, n)               // everything
+	check(key(100), key(200), 100, 199, 100) // [100,200)
+	check(key(0), key(1), 0, 0, 1)           // single key
+	check(key(n), nil, 0, 0, 0)              // past the end
+	check(key(2990), nil, 2990, n-1, 10)     // open ended
+}
+
+func TestTreeScanFollowsLeafChainAfterSplits(t *testing.T) {
+	// The leaf chain is what makes a range scan cheap; this checks it stays
+	// intact through hundreds of splits.
+	h := newHarness(t, 32)
+	tr := newTree(t, h)
+	const n = 10000
+	rng := rand.New(rand.NewSource(1))
+	for _, i := range rng.Perm(n) {
+		if err := tr.Insert(h.ctx, key(i), rid(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tr.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	it := tr.Scan(nil, nil)
+	prev := -1
+	count := 0
+	for it.Next() {
+		k := int(binary.BigEndian.Uint64(it.Key()))
+		if k <= prev {
+			t.Fatalf("scan out of order: %d after %d", k, prev)
+		}
+		prev, count = k, count+1
+	}
+	if it.Err() != nil {
+		t.Fatal(it.Err())
+	}
+	if count != n {
+		t.Fatalf("scan visited %d of %d entries", count, n)
 	}
 }
