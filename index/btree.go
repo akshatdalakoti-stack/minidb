@@ -466,3 +466,155 @@ func (t *Tree) insertInto(ctx pageops.Ctx, pid storage.PageID, key []byte, rid s
 func fits(p *storage.Page, entryLen int) bool {
 	return p.FreeSpace()+p.DeadSpace() >= entryLen+storage.SlotSize
 }
+
+func internalInsertPos(p *storage.Page, key []byte) (uint16, error) {
+	lo, hi := 0, int(p.NumSlots())
+	for lo < hi {
+		mid := (lo + hi) / 2
+		e, err := p.Get(uint16(mid))
+		if err != nil {
+			return 0, err
+		}
+		if bytes.Compare(internalKey(e), key) < 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return uint16(lo), nil
+}
+
+// collectEntries copies every entry out of a node.
+func collectEntries(p *storage.Page) ([][]byte, error) {
+	n := p.NumSlots()
+	out := make([][]byte, 0, n)
+	for i := uint16(0); i < n; i++ {
+		e, err := p.Get(i)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, append([]byte(nil), e...))
+	}
+	return out, nil
+}
+
+// splitPoint returns the index at which to cut a list of entries so that the
+// two halves hold roughly the same number of bytes.
+func splitPoint(entries [][]byte) int {
+	total := 0
+	for _, e := range entries {
+		total += len(e) + storage.SlotSize
+	}
+	half, running := total/2, 0
+	for i, e := range entries {
+		running += len(e) + storage.SlotSize
+		if running >= half {
+			if i == 0 {
+				return 1 // never produce an empty left node
+			}
+			if i == len(entries)-1 {
+				return i // never produce an empty right node
+			}
+			return i + 1
+		}
+	}
+	return len(entries) / 2
+}
+
+// keepCount converts a cut position in the augmented entry list into the
+// number of original page entries the left node should keep: one fewer when
+// the new entry itself landed on the left side.
+func keepCount(cut int, idx uint16) int {
+	if int(idx) < cut {
+		return cut - 1
+	}
+	return cut
+}
+
+// trimLeft deletes every entry from position keep onwards, back to front.
+func (t *Tree) trimLeft(ctx pageops.Ctx, h *buffer.Handle, keep int) error {
+	for i := int(h.Page().NumSlots()) - 1; i >= keep; i-- {
+		if err := ctx.DeleteShift(h, uint16(i)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// replaceEntry overwrites an entry, falling back to delete+insert when the new
+// entry is longer than the page can absorb in place. Separator keys can grow
+// when a borrow moves a longer key up into the parent.
+func replaceEntry(ctx pageops.Ctx, h *buffer.Handle, idx uint16, entry []byte) error {
+	if h.Page().CanUpdate(idx, len(entry)) {
+		return ctx.Update(h, idx, entry)
+	}
+	if err := ctx.DeleteShift(h, idx); err != nil {
+		return err
+	}
+	return ctx.InsertShift(h, idx, entry)
+}
+
+// splitLeaf splits a full leaf, inserting `entry` at position idx in the
+// process, and returns the separator to push into the parent.
+func (t *Tree) splitLeaf(ctx pageops.Ctx, h *buffer.Handle, idx uint16, entry []byte) ([]byte, storage.PageID, error) {
+	p := h.Page()
+	entries, err := collectEntries(p)
+	if err != nil {
+		return nil, storage.InvalidPageID, err
+	}
+	entries = append(entries, nil)
+	copy(entries[idx+1:], entries[idx:])
+	entries[idx] = entry
+
+	cut := splitPoint(entries)
+	rightH, err := ctx.NewPage(storage.PageTypeBTreeLeaf)
+	if err != nil {
+		return nil, storage.InvalidPageID, err
+	}
+	defer rightH.Release()
+
+	// Move the upper half into the new node.
+	for i, e := range entries[cut:] {
+		if err := ctx.InsertShift(rightH, uint16(i), e); err != nil {
+			return nil, storage.InvalidPageID, err
+		}
+	}
+	// Rewrite the left node. `entries` is the augmented list (it already
+	// contains the new entry), so the number of original entries the left node
+	// keeps is one fewer when the new entry landed on this side.
+	if err := t.trimLeft(ctx, h, keepCount(cut, idx)); err != nil {
+		return nil, storage.InvalidPageID, err
+	}
+	if int(idx) < cut {
+		if err := ctx.InsertShift(h, idx, entry); err != nil {
+			return nil, storage.InvalidPageID, err
+		}
+	}
+
+	// Relink the leaf chain: left <-> right <-> oldNext.
+	oldNext := p.NextPage()
+	if err := ctx.SetNext(rightH, oldNext); err != nil {
+		return nil, storage.InvalidPageID, err
+	}
+	if err := ctx.SetPrev(rightH, h.ID()); err != nil {
+		return nil, storage.InvalidPageID, err
+	}
+	if err := ctx.SetNext(h, rightH.ID()); err != nil {
+		return nil, storage.InvalidPageID, err
+	}
+	if oldNext != storage.InvalidPageID {
+		nh, err := t.pool.FetchWrite(oldNext)
+		if err != nil {
+			return nil, storage.InvalidPageID, err
+		}
+		err = ctx.SetPrev(nh, rightH.ID())
+		nh.Release()
+		if err != nil {
+			return nil, storage.InvalidPageID, err
+		}
+	}
+	// For a leaf split the separator is a copy of the first entry on the
+	// right (the entry itself stays in the leaf - all data lives in leaves).
+	sep := append([]byte(nil), entries[cut]...)
+	return sep, rightH.ID(), nil
+}
