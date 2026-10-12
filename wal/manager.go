@@ -322,3 +322,50 @@ func (m *Manager) Scan(from LSN, fn func(*Record) error) error {
 	}
 	return nil
 }
+
+// Sync flushes everything and fsyncs.
+func (m *Manager) Sync() error { return m.Flush(0) }
+
+// Close flushes and closes the log file.
+func (m *Manager) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return nil
+	}
+	if err := m.flushLocked(m.nextLSN); err != nil {
+		m.f.Close()
+		m.closed = true
+		return err
+	}
+	m.closed = true
+	return m.f.Close()
+}
+
+// CloseNoFlush discards the buffered log tail and closes the file, modelling a
+// process that was killed: records that were appended but never flushed are
+// gone. Anything a committed transaction depended on is already durable,
+// because Commit flushes before it returns. Tests only.
+func (m *Manager) CloseNoFlush() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return nil
+	}
+	m.closed = true
+	m.buf = m.buf[:0]
+	return m.f.Close()
+}
+
+// Stats returns log activity counters.
+func (m *Manager) Stats() Stats {
+	return Stats{
+		Appends:      m.appends.Load(),
+		Syncs:        m.syncs.Load(),
+		BytesWritten: m.bytes.Load(),
+		Flushes:      m.flushes.Load(),
+	}
+}
+
+// Path is the log file path.
+func (m *Manager) Path() string { return m.path }
