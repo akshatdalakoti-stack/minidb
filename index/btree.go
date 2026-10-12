@@ -36,11 +36,13 @@ package index
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"sync"
 
 	"minidb/buffer"
 	"minidb/pageops"
 	"minidb/storage"
+	"minidb/wal"
 )
 
 // Errors returned by the index.
@@ -361,3 +363,106 @@ func (t *Tree) findLeftmostLeaf() (storage.PageID, error) {
 }
 
 // --- insert ----------------------------------------------------------------
+
+// Insert adds key -> rid to the tree.
+//
+// The logical operation is logged first (so a rollback can undo it by calling
+// Delete), and the page changes underneath are logged as redo-only structural
+// records.
+func (t *Tree) Insert(ctx pageops.Ctx, key []byte, rid storage.RID) error {
+	if len(key) > MaxKeySize {
+		return fmt.Errorf("%w: %d bytes (max %d)", ErrKeyTooLarge, len(key), MaxKeySize)
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if ctx.Log != nil {
+		if err := ctx.LogIndexOp(wal.TypeIdxInsert, t.meta, key, rid); err != nil {
+			return err
+		}
+	}
+	return t.insertUnlogged(ctx.Structural(), key, rid)
+}
+
+// insertUnlogged performs the physical insert. Rollback and recovery use it
+// directly, because they supply their own compensation records.
+func (t *Tree) insertUnlogged(ctx pageops.Ctx, key []byte, rid storage.RID) error {
+	root, err := t.rootID()
+	if err != nil {
+		return err
+	}
+	sep, right, err := t.insertInto(ctx, root, key, rid)
+	if err != nil || sep == nil {
+		return err
+	}
+	// The root split: the tree grows by one level. This is the only way a
+	// B+tree gets taller, which is why it stays perfectly balanced.
+	newRootH, err := ctx.NewPage(storage.PageTypeBTreeInternal)
+	if err != nil {
+		return err
+	}
+	defer newRootH.Release()
+	if err := ctx.SetExtra(newRootH, uint32(root)); err != nil {
+		return err
+	}
+	if err := ctx.InsertShift(newRootH, 0, internalEntry(sep, right)); err != nil {
+		return err
+	}
+	metaH, err := t.pool.FetchWrite(t.meta)
+	if err != nil {
+		return err
+	}
+	defer metaH.Release()
+	return ctx.SetExtra(metaH, uint32(newRootH.ID()))
+}
+
+// insertInto inserts into the subtree rooted at pid. If the node had to split,
+// it returns the separator key to install in the parent and the new right
+// sibling.
+func (t *Tree) insertInto(ctx pageops.Ctx, pid storage.PageID, key []byte, rid storage.RID) ([]byte, storage.PageID, error) {
+	h, err := t.pool.FetchWrite(pid)
+	if err != nil {
+		return nil, storage.InvalidPageID, err
+	}
+	defer h.Release()
+	p := h.Page()
+
+	if isLeaf(p) {
+		idx, found, err := leafSearch(p, key, rid)
+		if err != nil {
+			return nil, storage.InvalidPageID, err
+		}
+		if found {
+			return nil, storage.InvalidPageID, nil // already present: idempotent
+		}
+		entry := leafEntry(key, rid)
+		if fits(p, len(entry)) {
+			return nil, storage.InvalidPageID, ctx.InsertShift(h, idx, entry)
+		}
+		return t.splitLeaf(ctx, h, idx, entry)
+	}
+
+	child, _, err := childFor(p, leafEntry(key, rid))
+	if err != nil {
+		return nil, storage.InvalidPageID, err
+	}
+	sep, right, err := t.insertInto(ctx, child, key, rid)
+	if err != nil || sep == nil {
+		return nil, storage.InvalidPageID, err
+	}
+	// The child split; install the separator here.
+	idx, err := internalInsertPos(p, sep)
+	if err != nil {
+		return nil, storage.InvalidPageID, err
+	}
+	entry := internalEntry(sep, right)
+	if fits(p, len(entry)) {
+		return nil, storage.InvalidPageID, ctx.InsertShift(h, idx, entry)
+	}
+	return t.splitInternal(ctx, h, idx, entry)
+}
+
+// fits reports whether an entry of the given size can be added to a node.
+func fits(p *storage.Page, entryLen int) bool {
+	return p.FreeSpace()+p.DeadSpace() >= entryLen+storage.SlotSize
+}
