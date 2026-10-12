@@ -110,3 +110,87 @@ func (c Ctx) Insert(h *buffer.Handle, rec storage.Record) (uint16, error) {
 	}
 	return slot, nil
 }
+
+// InsertAt adds a record at a specific slot.
+func (c Ctx) InsertAt(h *buffer.Handle, slot uint16, rec storage.Record) error {
+	r := &wal.Record{Type: wal.TypeInsert, Slot: slot, After: rec}
+	return c.emit(h, r, func() error { return h.Page().InsertAt(slot, rec) })
+}
+
+// InsertShift inserts into an ordered page (a B+tree node), shifting the
+// slot array right from slot onwards.
+func (c Ctx) InsertShift(h *buffer.Handle, slot uint16, rec storage.Record) error {
+	r := &wal.Record{Type: wal.TypeInsert, Slot: slot, After: rec, Flags: wal.FlagShift}
+	return c.emit(h, r, func() error { return h.Page().InsertShift(slot, rec) })
+}
+
+// DeleteShift removes an entry from an ordered page, shifting the slot array
+// left. The removed entry is logged so the delete can be reversed.
+func (c Ctx) DeleteShift(h *buffer.Handle, slot uint16) error {
+	old, err := h.Page().Get(slot)
+	if err != nil {
+		return err
+	}
+	before := append([]byte(nil), old...)
+	r := &wal.Record{Type: wal.TypeDelete, Slot: slot, Before: before, Flags: wal.FlagShift}
+	return c.emit(h, r, func() error { return h.Page().DeleteShift(slot) })
+}
+
+// Update replaces the record in a slot, logging the before image so the change
+// can be rolled back.
+func (c Ctx) Update(h *buffer.Handle, slot uint16, rec storage.Record) error {
+	old, err := h.Page().Get(slot)
+	if err != nil {
+		return err
+	}
+	// Refuse before logging: an operation that is logged and then fails to
+	// apply leaves a record that recovery could never replay.
+	if !h.Page().CanUpdate(slot, len(rec)) {
+		return storage.ErrPageFull
+	}
+	before := append([]byte(nil), old...)
+	r := &wal.Record{Type: wal.TypeUpdate, Slot: slot, Before: before, After: rec}
+	return c.emit(h, r, func() error { return h.Page().Update(slot, rec) })
+}
+
+// Delete removes the record in a slot, logging its contents so it can come back.
+func (c Ctx) Delete(h *buffer.Handle, slot uint16) error {
+	old, err := h.Page().Get(slot)
+	if err != nil {
+		return err
+	}
+	before := append([]byte(nil), old...)
+	r := &wal.Record{Type: wal.TypeDelete, Slot: slot, Before: before}
+	return c.emit(h, r, func() error { return h.Page().Delete(slot) })
+}
+
+// InitPage formats a page as an empty slotted page of the given type.
+func (c Ctx) InitPage(h *buffer.Handle, t storage.PageType) error {
+	r := &wal.Record{Type: wal.TypePageInit, Op: uint8(t), Flags: wal.FlagRedoOnly}
+	return c.emit(h, r, func() error { h.Page().InitSlotted(t); return nil })
+}
+
+// SetNext, SetPrev and SetExtra change a single header field, logging the old
+// value so the change is reversible. These are how page chains (heap file
+// pages, B+tree leaf siblings) are maintained.
+func (c Ctx) SetNext(h *buffer.Handle, id storage.PageID) error {
+	return c.setHeader(h, wal.HdrNext, uint32(h.Page().NextPage()), uint32(id))
+}
+
+func (c Ctx) SetPrev(h *buffer.Handle, id storage.PageID) error {
+	return c.setHeader(h, wal.HdrPrev, uint32(h.Page().PrevPage()), uint32(id))
+}
+
+func (c Ctx) SetExtra(h *buffer.Handle, v uint32) error {
+	return c.setHeader(h, wal.HdrExtra, h.Page().Extra(), v)
+}
+
+func (c Ctx) setHeader(h *buffer.Handle, field uint8, old, new uint32) error {
+	r := &wal.Record{
+		Type:   wal.TypePageHeader,
+		Op:     field,
+		Before: wal.U32(old),
+		After:  wal.U32(new),
+	}
+	return c.emit(h, r, func() error { return wal.Redo(h.Page(), r) })
+}
