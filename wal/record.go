@@ -277,3 +277,118 @@ func DecodeRecord(buf []byte) (*Record, int, error) {
 }
 
 // --- applying a record to a page ------------------------------------------
+
+// Redo applies the record's after image to the page. It is used both by the
+// recovery redo pass and by the undo pass (a CLR is redone, never undone).
+//
+// The caller is responsible for the LSN check: only apply a record whose LSN
+// is greater than the page LSN, otherwise the change is already there.
+func Redo(page *storage.Page, r *Record) error {
+	switch r.Type {
+	case TypeInsert:
+		if r.Flags&FlagShift != 0 {
+			return page.InsertShift(r.Slot, r.After)
+		}
+		return page.InsertAt(r.Slot, r.After)
+	case TypeUpdate:
+		if !page.SlotOccupied(r.Slot) {
+			return page.InsertAt(r.Slot, r.After)
+		}
+		return page.Update(r.Slot, r.After)
+	case TypeDelete:
+		if r.Flags&FlagShift != 0 {
+			return page.DeleteShift(r.Slot)
+		}
+		if !page.SlotOccupied(r.Slot) {
+			return nil // already deleted
+		}
+		return page.Delete(r.Slot)
+	case TypePageInit:
+		page.InitSlotted(storage.PageType(r.Op))
+		return nil
+	case TypePageHeader:
+		return applyHeader(page, r.Op, r.After)
+	case TypeCLR:
+		// A CLR carries the operation to perform in Op, and the compensated
+		// record's own Op (a page header field id, say) in Op2.
+		sub := *r
+		sub.Type = Type(r.Op)
+		sub.Op = r.Op2
+		return Redo(page, &sub)
+	case TypeAllocPage, TypeBegin, TypeCommit, TypeAbort, TypeEnd,
+		TypeIdxInsert, TypeIdxDelete, TypeCheckpointBegin, TypeCheckpointEnd:
+		return nil // nothing physical to redo
+	}
+	return fmt.Errorf("wal: cannot redo record type %v", r.Type)
+}
+
+// Undo applies the record's before image to the page, reversing it. The caller
+// must have written a CLR describing this action first.
+func Undo(page *storage.Page, r *Record) error {
+	switch r.Type {
+	case TypeInsert:
+		if r.Flags&FlagShift != 0 {
+			return page.DeleteShift(r.Slot)
+		}
+		if page.SlotOccupied(r.Slot) {
+			return page.Delete(r.Slot)
+		}
+		return nil
+	case TypeUpdate:
+		if !page.SlotOccupied(r.Slot) {
+			return page.InsertAt(r.Slot, r.Before)
+		}
+		return page.Update(r.Slot, r.Before)
+	case TypeDelete:
+		if r.Flags&FlagShift != 0 {
+			return page.InsertShift(r.Slot, r.Before)
+		}
+		return page.InsertAt(r.Slot, r.Before)
+	case TypePageHeader:
+		return applyHeader(page, r.Op, r.Before)
+	}
+	return fmt.Errorf("wal: cannot undo record type %v", r.Type)
+}
+
+// UndoOpFor returns the operation a CLR should carry to reverse r, together
+// with the image to apply.
+func UndoOpFor(r *Record) (op Type, image []byte) {
+	switch r.Type {
+	case TypeInsert:
+		return TypeDelete, nil
+	case TypeUpdate:
+		return TypeUpdate, r.Before
+	case TypeDelete:
+		return TypeInsert, r.Before
+	case TypePageHeader:
+		return TypePageHeader, r.Before
+	}
+	return TypeInvalid, nil
+}
+
+func applyHeader(page *storage.Page, field uint8, val []byte) error {
+	if len(val) < 4 {
+		return fmt.Errorf("wal: header record with %d byte value", len(val))
+	}
+	v := binary.LittleEndian.Uint32(val)
+	switch field {
+	case HdrNext:
+		page.SetNextPage(storage.PageID(v))
+	case HdrPrev:
+		page.SetPrevPage(storage.PageID(v))
+	case HdrType:
+		page.SetType(storage.PageType(v))
+	case HdrExtra:
+		page.SetExtra(v)
+	default:
+		return fmt.Errorf("wal: unknown header field %d", field)
+	}
+	return nil
+}
+
+// U32 encodes a uint32 as a 4 byte log image (helper for header records).
+func U32(v uint32) []byte {
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], v)
+	return b[:]
+}
