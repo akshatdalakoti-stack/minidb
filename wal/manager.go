@@ -3,6 +3,7 @@ package wal
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -99,4 +100,95 @@ func Open(path string) (*Manager, error) {
 	}
 	m.nextLSN, m.flushed, m.bufStart = LSN(end), LSN(end), LSN(end)
 	return m, nil
+}
+
+// findEnd scans the log and returns the offset just past the last intact
+// record.
+//
+// The scan reads in chunks, so a record can straddle a chunk boundary. That
+// looks exactly like a torn record, and getting the distinction wrong is
+// catastrophic: the log would be truncated at the boundary and every commit
+// after it silently lost. A failed decode therefore only means "end of log"
+// when it happens at the very start of a chunk that already extends to the end
+// of the file.
+func (m *Manager) findEnd(size int64) (int64, error) {
+	off := int64(logHeaderSize)
+	buf := make([]byte, 0, 256*1024)
+	for off < size {
+		n := size - off
+		if n > int64(cap(buf)) {
+			n = int64(cap(buf))
+		}
+		buf = buf[:n]
+		if _, err := m.f.ReadAt(buf, off); err != nil && err != io.EOF {
+			return 0, err
+		}
+		consumed := 0
+		grew := false
+		for consumed < len(buf) {
+			_, sz, err := DecodeRecord(buf[consumed:])
+			if err != nil {
+				if consumed > 0 {
+					break // probably straddling the chunk: resume from here
+				}
+				if int64(len(buf)) >= size-off {
+					return off, nil // genuinely torn: this is the end
+				}
+				buf = make([]byte, 0, cap(buf)*2) // one record is bigger than the chunk
+				grew = true
+				break
+			}
+			consumed += sz
+		}
+		if grew {
+			continue
+		}
+		if consumed == 0 {
+			return off, nil
+		}
+		off += int64(consumed)
+	}
+	return off, nil
+}
+
+// SetNoSync disables fsync on flush. Only for benchmarks that measure
+// throughput without the storage device in the way - it gives up durability.
+func (m *Manager) SetNoSync(v bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.noSync = v
+}
+
+// Append adds a record to the log and returns its LSN. The record is not
+// durable until Flush covers it.
+func (m *Manager) Append(r *Record) (LSN, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return InvalidLSN, os.ErrClosed
+	}
+	r.LSN = m.nextLSN
+	before := len(m.buf)
+	buf, err := r.AppendTo(m.buf)
+	if err != nil {
+		return InvalidLSN, err
+	}
+	m.buf = buf
+	m.nextLSN += LSN(len(m.buf) - before)
+	m.appends.Add(1)
+	return r.LSN, nil
+}
+
+// writeBufferLocked hands the buffered tail to the OS (no fsync).
+func (m *Manager) writeBufferLocked() error {
+	if len(m.buf) == 0 {
+		return nil
+	}
+	if _, err := m.f.WriteAt(m.buf, int64(m.bufStart)); err != nil {
+		return fmt.Errorf("wal: write log: %w", err)
+	}
+	m.bytes.Add(int64(len(m.buf)))
+	m.bufStart += LSN(len(m.buf))
+	m.buf = m.buf[:0]
+	return nil
 }
