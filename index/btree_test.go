@@ -3,9 +3,11 @@ package index
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"math/rand"
 	"path/filepath"
 	"sort"
+	"sync"
 	"testing"
 
 	"minidb/buffer"
@@ -314,5 +316,168 @@ func TestTreeScanFollowsLeafChainAfterSplits(t *testing.T) {
 	}
 	if count != n {
 		t.Fatalf("scan visited %d of %d entries", count, n)
+	}
+}
+
+func TestTreeVariableLengthKeys(t *testing.T) {
+	h := newHarness(t, 64)
+	tr := newTree(t, h)
+
+	words := make([]string, 0, 2000)
+	rng := rand.New(rand.NewSource(3))
+	for i := 0; i < 2000; i++ {
+		n := 1 + rng.Intn(60)
+		b := make([]byte, n)
+		for j := range b {
+			b[j] = byte('a' + rng.Intn(26))
+		}
+		words = append(words, fmt.Sprintf("%s-%d", b, i))
+	}
+	for i, w := range words {
+		if err := tr.Insert(h.ctx, []byte(w), rid(i)); err != nil {
+			t.Fatalf("insert %q: %v", w, err)
+		}
+	}
+	if err := tr.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for i, w := range words {
+		got, err := tr.Search([]byte(w))
+		if err != nil || len(got) != 1 || got[0] != rid(i) {
+			t.Fatalf("search %q = %v (%v)", w, got, err)
+		}
+	}
+	// Sorted order must be byte order.
+	sorted := append([]string(nil), words...)
+	sort.Strings(sorted)
+	it := tr.Scan(nil, nil)
+	i := 0
+	for it.Next() {
+		if string(it.Key()) != sorted[i] {
+			t.Fatalf("position %d: got %q want %q", i, it.Key(), sorted[i])
+		}
+		i++
+	}
+	if i != len(sorted) {
+		t.Fatalf("scanned %d of %d", i, len(sorted))
+	}
+}
+
+func TestTreeKeyTooLarge(t *testing.T) {
+	h := newHarness(t, 16)
+	tr := newTree(t, h)
+	big := bytes.Repeat([]byte("k"), MaxKeySize+1)
+	if err := tr.Insert(h.ctx, big, rid(1)); err == nil {
+		t.Fatal("oversized key was accepted")
+	}
+}
+
+func TestTreeSurvivesReopen(t *testing.T) {
+	h := newHarness(t, 16)
+	tr := newTree(t, h)
+	meta := tr.MetaPage()
+	for i := 0; i < 2000; i++ {
+		if err := tr.Insert(h.ctx, key(i), rid(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.pool.FlushAllPages(); err != nil {
+		t.Fatal(err)
+	}
+	// A new Tree object over the same meta page must see the same data - the
+	// tree lives on disk, not in the struct.
+	tr2 := Open(h.pool, meta, "test_idx")
+	if c, _ := tr2.Count(); c != 2000 {
+		t.Fatalf("reopened tree has %d entries", c)
+	}
+	got, err := tr2.Search(key(1234))
+	if err != nil || len(got) != 1 {
+		t.Fatalf("search after reopen: %v %v", got, err)
+	}
+}
+
+func TestTreeSmallBufferPool(t *testing.T) {
+	// Four frames: every descent evicts something. This is the test that
+	// catches "I forgot to unpin" bugs.
+	h := newHarness(t, 4)
+	tr := newTree(t, h)
+	for i := 0; i < 3000; i++ {
+		if err := tr.Insert(h.ctx, key(i), rid(i)); err != nil {
+			t.Fatalf("insert %d with a tiny pool: %v", i, err)
+		}
+	}
+	if err := tr.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if s := h.pool.Stats(); s.Pinned != 0 {
+		t.Fatalf("pins leaked: %v", s)
+	}
+	for i := 0; i < 3000; i += 97 {
+		if got, _ := tr.Search(key(i)); len(got) != 1 {
+			t.Fatalf("key %d missing", i)
+		}
+	}
+}
+
+func TestTreeConcurrentReadersAndWriters(t *testing.T) {
+	h := newHarness(t, 64)
+	tr := newTree(t, h)
+	for i := 0; i < 2000; i++ {
+		if err := tr.Insert(h.ctx, key(i), rid(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	// Writers insert disjoint ranges.
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < 500; i++ {
+				k := 10000 + w*1000 + i
+				if err := tr.Insert(h.ctx, key(k), rid(k)); err != nil {
+					t.Errorf("concurrent insert: %v", err)
+					return
+				}
+			}
+		}(w)
+	}
+	// Readers search and scan while that happens.
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func(r int) {
+			defer wg.Done()
+			for i := 0; i < 500; i++ {
+				k := (r*137 + i) % 2000
+				got, err := tr.Search(key(k))
+				if err != nil {
+					t.Errorf("concurrent search: %v", err)
+					return
+				}
+				if len(got) != 1 {
+					t.Errorf("key %d lost during concurrent inserts: %v", k, got)
+					return
+				}
+			}
+			it := tr.Scan(key(0), key(2000))
+			n := 0
+			for it.Next() {
+				n++
+			}
+			if it.Err() != nil {
+				t.Errorf("concurrent scan: %v", it.Err())
+			}
+			if n != 2000 {
+				t.Errorf("concurrent scan saw %d of the 2000 pre-existing keys", n)
+			}
+		}(r)
+	}
+	wg.Wait()
+	if err := tr.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := tr.Count(); c != 4000 {
+		t.Fatalf("count = %d want 4000", c)
 	}
 }
