@@ -252,3 +252,108 @@ func (hp *Heap) Get(rid storage.RID) (storage.Record, error) {
 	// copy rather than a pointer into the frame.
 	return append(storage.Record(nil), rec...), nil
 }
+
+// Update replaces the record at rid.
+//
+// If the new version still fits on its page, the RID does not change. If it
+// does not fit, the record is moved to another page and the new RID is
+// returned: the caller (which owns the indexes) is responsible for repointing
+// index entries. Making relocation explicit rather than hiding it behind a
+// forwarding pointer keeps the heap simple and the cost visible.
+func (hp *Heap) Update(ctx pageops.Ctx, rid storage.RID, rec storage.Record) (storage.RID, error) {
+	if len(rec) > storage.MaxRecordSize {
+		return storage.InvalidRID, fmt.Errorf("%w: %d bytes", ErrRecordTooLarge, len(rec))
+	}
+	h, err := hp.pool.FetchWrite(rid.PageID)
+	if err != nil {
+		return storage.InvalidRID, err
+	}
+	if !h.Page().SlotOccupied(rid.Slot) {
+		h.Release()
+		return storage.InvalidRID, fmt.Errorf("%w: %v", ErrRecordNotFound, rid)
+	}
+	err = ctx.Update(h, rid.Slot, rec)
+	if err == nil {
+		h.Release()
+		return rid, nil
+	}
+	if !errors.Is(err, storage.ErrPageFull) {
+		h.Release()
+		return storage.InvalidRID, err
+	}
+	// Does not fit any more: delete here, insert elsewhere.
+	if err := ctx.Delete(h, rid.Slot); err != nil {
+		h.Release()
+		return storage.InvalidRID, err
+	}
+	h.Release()
+	hp.addFreeish(rid.PageID)
+	return hp.Insert(ctx, rec)
+}
+
+// Delete removes the record at rid.
+func (hp *Heap) Delete(ctx pageops.Ctx, rid storage.RID) error {
+	h, err := hp.pool.FetchWrite(rid.PageID)
+	if err != nil {
+		return err
+	}
+	if !h.Page().SlotOccupied(rid.Slot) {
+		h.Release()
+		return fmt.Errorf("%w: %v", ErrRecordNotFound, rid)
+	}
+	err = ctx.Delete(h, rid.Slot)
+	h.Release()
+	if err == nil {
+		hp.addFreeish(rid.PageID)
+	}
+	return err
+}
+
+func (hp *Heap) addFreeish(pid storage.PageID) {
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	if hp.inFreeish[pid] || pid == hp.tail {
+		return
+	}
+	if len(hp.freeish) >= maxFreeish {
+		return
+	}
+	hp.freeish = append(hp.freeish, pid)
+	hp.inFreeish[pid] = true
+}
+
+func (hp *Heap) dropFreeish(pid storage.PageID) {
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	if !hp.inFreeish[pid] {
+		return
+	}
+	delete(hp.inFreeish, pid)
+	for i, p := range hp.freeish {
+		if p == pid {
+			hp.freeish = append(hp.freeish[:i], hp.freeish[i+1:]...)
+			return
+		}
+	}
+}
+
+// --- scanning --------------------------------------------------------------
+
+// Row is one record produced by a scan.
+type Row struct {
+	RID    storage.RID
+	Record storage.Record
+}
+
+// Scanner walks every live record in the heap, page by page.
+//
+// Like the index iterator, it copies a page's worth of records out under a
+// read latch and then releases the page, so a long scan never pins a frame or
+// blocks a writer for longer than one page takes to copy.
+type Scanner struct {
+	heap  *Heap
+	next  storage.PageID
+	batch []Row
+	pos   int
+	err   error
+}
