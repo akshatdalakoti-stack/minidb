@@ -481,3 +481,123 @@ func TestTreeConcurrentReadersAndWriters(t *testing.T) {
 		t.Fatalf("count = %d want 4000", c)
 	}
 }
+
+func TestTreeInterleavedInsertDelete(t *testing.T) {
+	// Differential test against a sorted model, with the tree validated
+	// throughout: this is what catches split/merge index arithmetic bugs.
+	h := newHarness(t, 32)
+	tr := newTree(t, h)
+	model := map[int]bool{}
+	rng := rand.New(rand.NewSource(11))
+
+	for round := 0; round < 6000; round++ {
+		k := rng.Intn(1500)
+		if rng.Intn(100) < 60 {
+			if err := tr.Insert(h.ctx, key(k), rid(k)); err != nil {
+				t.Fatalf("round %d insert %d: %v", round, k, err)
+			}
+			model[k] = true
+		} else {
+			ok, err := tr.Delete(h.ctx, key(k), rid(k))
+			if err != nil {
+				t.Fatalf("round %d delete %d: %v", round, k, err)
+			}
+			if ok != model[k] {
+				t.Fatalf("round %d: delete %d reported %v, model says %v", round, k, ok, model[k])
+			}
+			delete(model, k)
+		}
+		if round%500 == 0 {
+			if err := tr.Validate(); err != nil {
+				t.Fatalf("round %d: %v", round, err)
+			}
+		}
+	}
+	if err := tr.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := tr.Count(); c != len(model) {
+		t.Fatalf("count = %d, model has %d", c, len(model))
+	}
+	for k := 0; k < 1500; k++ {
+		got, err := tr.Search(key(k))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if (len(got) == 1) != model[k] {
+			t.Fatalf("key %d: tree has %d entries, model says present=%v", k, len(got), model[k])
+		}
+	}
+}
+
+// --- benchmarks ------------------------------------------------------------
+
+func BenchmarkTreeInsertSequential(b *testing.B) {
+	h := newHarness(b, 512)
+	tr := newTree(b, h)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := tr.Insert(h.ctx, key(i), rid(i)); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkTreeInsertRandom(b *testing.B) {
+	h := newHarness(b, 512)
+	tr := newTree(b, h)
+	rng := rand.New(rand.NewSource(5))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		k := rng.Intn(1 << 30)
+		if err := tr.Insert(h.ctx, key(k), rid(k)); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkTreeSearch(b *testing.B) {
+	h := newHarness(b, 512)
+	tr := newTree(b, h)
+	const n = 100000
+	for i := 0; i < n; i++ {
+		if err := tr.Insert(h.ctx, key(i), rid(i)); err != nil {
+			b.Fatal(err)
+		}
+	}
+	h.pool.ResetStats()
+	rng := rand.New(rand.NewSource(6))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := tr.Search(key(rng.Intn(n))); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(h.pool.Stats().HitRatio(), "hit-ratio")
+}
+
+func BenchmarkTreeRangeScan(b *testing.B) {
+	h := newHarness(b, 512)
+	tr := newTree(b, h)
+	const n = 100000
+	for i := 0; i < n; i++ {
+		if err := tr.Insert(h.ctx, key(i), rid(i)); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ResetTimer()
+	scanned := 0
+	for i := 0; i < b.N; i++ {
+		start := (i * 997) % (n - 1000)
+		it := tr.Scan(key(start), key(start+1000))
+		for it.Next() {
+			scanned++
+		}
+		if it.Err() != nil {
+			b.Fatal(it.Err())
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(scanned)/float64(b.N), "entries/op")
+}
