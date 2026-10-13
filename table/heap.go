@@ -153,3 +153,102 @@ func (hp *Heap) Insert(ctx pageops.Ctx, rec storage.Record) (storage.RID, error)
 	}
 	return storage.InvalidRID, errors.New("table: could not place record after 8 attempts")
 }
+
+func (hp *Heap) tryInsert(ctx pageops.Ctx, pid storage.PageID, rec storage.Record) (storage.RID, bool, error) {
+	if pid == storage.InvalidPageID {
+		return storage.InvalidRID, false, nil
+	}
+	h, err := hp.pool.FetchWrite(pid)
+	if err != nil {
+		return storage.InvalidRID, false, err
+	}
+	defer h.Release()
+	if h.Page().FreeSpace()+h.Page().DeadSpace() < len(rec)+storage.SlotSize {
+		return storage.InvalidRID, false, nil
+	}
+	slot, err := ctx.Insert(h, rec)
+	if err != nil {
+		if errors.Is(err, storage.ErrPageFull) {
+			return storage.InvalidRID, false, nil
+		}
+		return storage.InvalidRID, false, err
+	}
+	return storage.RID{PageID: pid, Slot: slot}, true, nil
+}
+
+// grow adds a page to the end of the chain and puts the record on it. It
+// reports ok=false if another goroutine already grew the heap since the caller
+// last looked, in which case the caller should retry against the new tail.
+//
+// hp.mu is held for the whole operation. Nothing takes hp.mu while holding a
+// page latch, so this cannot invert a lock order.
+func (hp *Heap) grow(ctx pageops.Ctx, rec storage.Record, triedTail storage.PageID) (storage.RID, bool, error) {
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+	if hp.tail != triedTail {
+		return storage.InvalidRID, false, nil
+	}
+	oldTail := hp.tail
+
+	newH, err := ctx.NewPage(storage.PageTypeHeap)
+	if err != nil {
+		return storage.InvalidRID, false, err
+	}
+	defer newH.Release()
+	slot, err := ctx.Insert(newH, rec)
+	if err != nil {
+		return storage.InvalidRID, false, err
+	}
+
+	// Link it in: tail.Next = new, then meta.Next = new. The order matters -
+	// if we crash between the two, the chain is still walkable from the head
+	// and only the tail hint is stale.
+	//
+	// The linking is logged as structural (redo-only), exactly like a B+tree
+	// split. Growing the file is not this transaction's private business: once
+	// the page is in the chain other transactions put their own records on it,
+	// and undoing the link during a rollback would cut their committed rows
+	// out of the table. An aborted transaction leaves an empty page behind
+	// instead, which is only wasted space.
+	sctx := ctx.Structural()
+	tailH, err := hp.pool.FetchWrite(oldTail)
+	if err != nil {
+		return storage.InvalidRID, false, err
+	}
+	err = sctx.SetNext(tailH, newH.ID())
+	tailH.Release()
+	if err != nil {
+		return storage.InvalidRID, false, err
+	}
+	metaH, err := hp.pool.FetchWrite(hp.meta)
+	if err != nil {
+		return storage.InvalidRID, false, err
+	}
+	err = sctx.SetNext(metaH, newH.ID())
+	metaH.Release()
+	if err != nil {
+		return storage.InvalidRID, false, err
+	}
+
+	hp.tail = newH.ID()
+	return storage.RID{PageID: newH.ID(), Slot: slot}, true, nil
+}
+
+// Get returns a copy of the record at rid.
+func (hp *Heap) Get(rid storage.RID) (storage.Record, error) {
+	h, err := hp.pool.FetchRead(rid.PageID)
+	if err != nil {
+		return nil, err
+	}
+	defer h.Release()
+	rec, err := h.Page().Get(rid.Slot)
+	if err != nil {
+		if errors.Is(err, storage.ErrRecordDeleted) || errors.Is(err, storage.ErrInvalidSlot) {
+			return nil, fmt.Errorf("%w: %v", ErrRecordNotFound, rid)
+		}
+		return nil, err
+	}
+	// The page is unpinned when this function returns, so the caller gets a
+	// copy rather than a pointer into the frame.
+	return append(storage.Record(nil), rec...), nil
+}
