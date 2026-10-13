@@ -16,7 +16,10 @@
 package txn
 
 import (
+	"fmt"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"minidb/wal"
 )
@@ -131,4 +134,142 @@ func (t *Txn) recordLock(k Key, m Mode) {
 	}
 	t.locks[k] = m
 	t.mu.Unlock()
+}
+
+func (t *Txn) heldMode(k Key) (Mode, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	m, ok := t.locks[k]
+	return m, ok
+}
+
+func (t *Txn) lockKeys() []Key {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]Key, 0, len(t.locks))
+	for k := range t.locks {
+		out = append(out, k)
+	}
+	return out
+}
+
+func (t *Txn) clearLocks() {
+	t.mu.Lock()
+	t.locks = nil
+	t.mu.Unlock()
+}
+
+func (t *Txn) String() string {
+	return fmt.Sprintf("txn%d(%s)", t.id, t.State())
+}
+
+// Undoer rolls a transaction back. The db layer supplies it, because undo
+// needs to touch pages and indexes.
+type Undoer interface {
+	Rollback(t *Txn) error
+}
+
+// Manager creates transactions and ends them.
+type Manager struct {
+	log    *wal.Manager
+	locks  *LockManager
+	nextID atomic.Uint64
+
+	mu     sync.Mutex
+	active map[ID]*Txn
+	undoer Undoer
+
+	commits atomic.Int64
+	aborts  atomic.Int64
+}
+
+// NewManager creates a transaction manager. firstID is the transaction id to
+// start from - on restart it comes from the meta page, so ids never repeat.
+func NewManager(log *wal.Manager, lockTimeout time.Duration, firstID ID) *Manager {
+	m := &Manager{
+		log:    log,
+		locks:  NewLockManager(lockTimeout),
+		active: make(map[ID]*Txn),
+	}
+	if firstID < 1 {
+		firstID = 1
+	}
+	m.nextID.Store(firstID)
+	return m
+}
+
+// SetUndoer installs the rollback implementation.
+func (m *Manager) SetUndoer(u Undoer) {
+	m.mu.Lock()
+	m.undoer = u
+	m.mu.Unlock()
+}
+
+// Locks exposes the lock manager.
+func (m *Manager) Locks() *LockManager { return m.locks }
+
+// NextID is the id the next Begin will hand out (persisted at checkpoint).
+func (m *Manager) NextID() ID { return m.nextID.Load() }
+
+// Begin starts a transaction and logs a BEGIN record.
+func (m *Manager) Begin() (*Txn, error) { return m.begin(false) }
+
+// BeginReadOnly starts a read-only transaction. It still takes shared locks
+// (so it never reads uncommitted data) but writes nothing to the log.
+func (m *Manager) BeginReadOnly() (*Txn, error) { return m.begin(true) }
+
+func (m *Manager) begin(readOnly bool) (*Txn, error) {
+	t := &Txn{id: m.nextID.Add(1) - 1, readOnly: readOnly, state: StateGrowing}
+	rec := &wal.Record{TxnID: t.id, Type: wal.TypeBegin}
+	lsn, err := m.log.Append(rec)
+	if err != nil {
+		return nil, err
+	}
+	t.SetLastLSN(lsn)
+	m.mu.Lock()
+	m.active[t.id] = t
+	m.mu.Unlock()
+	return t, nil
+}
+
+// Commit makes the transaction durable and releases its locks.
+//
+// The order matters and is the whole of Phase 7 in three lines: write the
+// COMMIT record, force the log to stable storage, and only then tell the
+// caller it worked. The data pages the transaction dirtied may still be sitting
+// in the buffer pool - that is fine, because the log can rebuild them.
+func (m *Manager) Commit(t *Txn) error {
+	if t == nil {
+		return ErrUnknownTxn
+	}
+	if s := t.State(); s == StateCommitted || s == StateAborted {
+		return fmt.Errorf("txn: commit of a %s transaction", s)
+	}
+	if t.Aborting() {
+		// Doomed by the deadlock detector: the only legal outcome is a rollback.
+		_ = m.Abort(t)
+		return ErrDeadlock
+	}
+	if !t.readOnly {
+		lsn, err := m.log.Append(&wal.Record{TxnID: t.id, Type: wal.TypeCommit, PrevLSN: t.LastLSN()})
+		if err != nil {
+			return err
+		}
+		t.SetLastLSN(lsn)
+		if err := m.log.Flush(lsn + 1); err != nil {
+			return fmt.Errorf("txn: commit flush: %w", err)
+		}
+	}
+	t.setState(StateCommitted)
+	m.locks.ReleaseAll(t)
+	if !t.readOnly {
+		// END is bookkeeping only: it tells recovery this transaction needs no
+		// further attention. It does not have to be flushed.
+		if lsn, err := m.log.Append(&wal.Record{TxnID: t.id, Type: wal.TypeEnd, PrevLSN: t.LastLSN()}); err == nil {
+			t.SetLastLSN(lsn)
+		}
+	}
+	m.forget(t)
+	m.commits.Add(1)
+	return nil
 }
