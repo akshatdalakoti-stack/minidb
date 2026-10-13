@@ -3,7 +3,9 @@ package table
 import (
 	"bytes"
 	"fmt"
+	"math/rand"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"minidb/buffer"
@@ -273,5 +275,134 @@ func TestHeapReopen(t *testing.T) {
 	// And it can still be appended to, on the tail page it recovered.
 	if _, err := hp2.Insert(h.ctx, rec(999999)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestHeapConcurrentInserts(t *testing.T) {
+	h := newHarness(t, 64)
+	hp := newHeap(t, h)
+
+	var mu sync.Mutex
+	all := map[storage.RID]string{}
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 250; i++ {
+				payload := fmt.Sprintf("g%d-i%d", g, i)
+				rid, err := hp.Insert(h.ctx, storage.Record(payload))
+				if err != nil {
+					t.Errorf("concurrent insert: %v", err)
+					return
+				}
+				mu.Lock()
+				if prev, dup := all[rid]; dup {
+					t.Errorf("RID %v handed out twice (%q and %q)", rid, prev, payload)
+				}
+				all[rid] = payload
+				mu.Unlock()
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	if n, _ := hp.Count(); n != 2000 {
+		t.Fatalf("count = %d want 2000", n)
+	}
+	for rid, payload := range all {
+		got, err := hp.Get(rid)
+		if err != nil || string(got) != payload {
+			t.Fatalf("rid %v: %q %v", rid, got, err)
+		}
+	}
+	if s := h.pool.Stats(); s.Pinned != 0 {
+		t.Fatalf("pins leaked: %v", s)
+	}
+}
+
+func TestHeapVariableSizedRecords(t *testing.T) {
+	h := newHarness(t, 32)
+	hp := newHeap(t, h)
+	rng := rand.New(rand.NewSource(9))
+	kept := map[storage.RID][]byte{}
+	for i := 0; i < 3000; i++ {
+		size := 1 + rng.Intn(1500)
+		payload := bytes.Repeat([]byte{byte('a' + i%26)}, size)
+		rid, err := hp.Insert(h.ctx, payload)
+		if err != nil {
+			t.Fatalf("insert of %d bytes: %v", size, err)
+		}
+		kept[rid] = payload
+	}
+	for rid, want := range kept {
+		got, err := hp.Get(rid)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("rid %v: %d bytes vs %d (%v)", rid, len(got), len(want), err)
+		}
+	}
+	// A record larger than a page has nowhere to go and must be refused
+	// clearly rather than silently truncated.
+	if _, err := hp.Insert(h.ctx, bytes.Repeat([]byte("x"), storage.PageSize)); err == nil {
+		t.Fatal("oversized record accepted")
+	}
+}
+
+func BenchmarkHeapInsert(b *testing.B) {
+	h := newHarness(b, 256)
+	hp := newHeap(b, h)
+	payload := bytes.Repeat([]byte("x"), 100)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := hp.Insert(h.ctx, payload); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkHeapGet(b *testing.B) {
+	h := newHarness(b, 256)
+	hp := newHeap(b, h)
+	const n = 50000
+	rids := make([]storage.RID, n)
+	for i := 0; i < n; i++ {
+		rids[i], _ = hp.Insert(h.ctx, rec(i))
+	}
+	h.pool.ResetStats()
+	rng := rand.New(rand.NewSource(2))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := hp.Get(rids[rng.Intn(n)]); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(h.pool.Stats().HitRatio(), "hit-ratio")
+}
+
+// BenchmarkHeapScanVsIndex is the "without index vs with index" comparison the
+// brief asks for: a full heap scan looking for one record, versus the same
+// lookup through a B+tree (benchmarked in the index package).
+func BenchmarkHeapFullScanLookup(b *testing.B) {
+	h := newHarness(b, 256)
+	hp := newHeap(b, h)
+	const n = 50000
+	for i := 0; i < n; i++ {
+		hp.Insert(h.ctx, rec(i))
+	}
+	target := rec(n - 1)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		found := false
+		s := hp.Scan()
+		for s.Next() {
+			if bytes.Equal(s.Row().Record, target) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			b.Fatal("target not found")
+		}
 	}
 }
