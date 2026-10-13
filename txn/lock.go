@@ -3,6 +3,7 @@ package txn
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -274,4 +275,124 @@ func (lm *LockManager) abortVictimLocked(victim ID) {
 			return
 		}
 	}
+}
+
+// detectDeadlock looks for a cycle in the wait-for graph that contains `from`.
+// It returns the transaction to abort (the youngest in the cycle), or 0.
+//
+// The graph is built on demand: an edge A -> B exists when A is waiting for a
+// key that B holds. Building it lazily costs nothing while there is no
+// contention, which is the normal case.
+func (lm *LockManager) detectDeadlock(from ID) ID {
+	visited := map[ID]bool{}
+	stack := map[ID]bool{}
+	var cycle []ID
+
+	var dfs func(id ID) bool
+	dfs = func(id ID) bool {
+		visited[id] = true
+		stack[id] = true
+		if key, waiting := lm.waitingOn[id]; waiting {
+			if e := lm.table[key]; e != nil {
+				holders := make([]ID, 0, len(e.holders))
+				for h := range e.holders {
+					if h != id {
+						holders = append(holders, h)
+					}
+				}
+				sort.Slice(holders, func(i, j int) bool { return holders[i] < holders[j] })
+				for _, h := range holders {
+					if stack[h] {
+						cycle = append(cycle, h, id)
+						return true
+					}
+					if !visited[h] && dfs(h) {
+						cycle = append(cycle, id)
+						return true
+					}
+				}
+			}
+		}
+		stack[id] = false
+		return false
+	}
+	if !dfs(from) {
+		return 0
+	}
+	// Abort the youngest transaction in the cycle: it has done the least work,
+	// and using transaction age as the tie-break guarantees progress.
+	victim := ID(0)
+	for _, id := range cycle {
+		if id > victim {
+			victim = id
+		}
+	}
+	return victim
+}
+
+// Release drops one lock. Normal code never calls this directly - strict 2PL
+// means locks go away at end of transaction - but recovery uses it.
+func (lm *LockManager) Release(t *Txn, key Key) {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	lm.releaseLocked(t.ID(), key)
+}
+
+// ReleaseAll drops every lock held by t and wakes the transactions that were
+// waiting for them. This is the "end of transaction" half of strict 2PL.
+func (lm *LockManager) ReleaseAll(t *Txn) {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	for _, key := range t.lockKeys() {
+		lm.releaseLocked(t.ID(), key)
+	}
+	t.clearLocks()
+	delete(lm.waitingOn, t.ID())
+	delete(lm.txns, t.ID())
+}
+
+func (lm *LockManager) releaseLocked(id ID, key Key) {
+	e := lm.table[key]
+	if e == nil {
+		return
+	}
+	delete(e.holders, id)
+	lm.grantWaitersLocked(e)
+	if len(e.holders) == 0 && len(e.waiters) == 0 {
+		delete(lm.table, key)
+	}
+}
+
+// grantWaitersLocked hands the lock to as many queued waiters as compatibility
+// allows, in FIFO order.
+func (lm *LockManager) grantWaitersLocked(e *lockEntry) {
+	for len(e.waiters) > 0 {
+		w := e.waiters[0]
+		conflict := false
+		for h, hm := range e.holders {
+			if h != w.txn.ID() && !compatible(hm, w.mode) {
+				conflict = true
+				break
+			}
+		}
+		if conflict {
+			return
+		}
+		e.waiters = e.waiters[1:]
+		e.holders[w.txn.ID()] = w.mode
+		w.txn.recordLock(e.key, w.mode)
+		delete(lm.waitingOn, w.txn.ID())
+		w.ch <- nil
+	}
+}
+
+// Stats reports lock table size, for tests and for the CLI's status output.
+func (lm *LockManager) Stats() (entries, waiters int) {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	for _, e := range lm.table {
+		entries++
+		waiters += len(e.waiters)
+	}
+	return
 }
