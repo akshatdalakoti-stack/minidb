@@ -1113,3 +1113,117 @@ func (it *Iterator) fill() error {
 	}
 	return nil
 }
+
+// Key is the current key. Valid after a Next that returned true.
+func (it *Iterator) Key() []byte { return it.lastKey }
+
+// RID is the current record id.
+func (it *Iterator) RID() storage.RID { return it.lastRID }
+
+// Err returns the error that stopped the iteration, if any.
+func (it *Iterator) Err() error { return it.err }
+
+// --- maintenance / introspection -------------------------------------------
+
+// Height returns the number of levels in the tree (1 = a single leaf).
+func (t *Tree) Height() (int, error) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	pid, err := t.rootID()
+	if err != nil {
+		return 0, err
+	}
+	h := 0
+	for {
+		ph, err := t.pool.FetchRead(pid)
+		if err != nil {
+			return 0, err
+		}
+		h++
+		p := ph.Page()
+		if isLeaf(p) {
+			ph.Release()
+			return h, nil
+		}
+		child, err := childAt(p, -1)
+		ph.Release()
+		if err != nil {
+			return 0, err
+		}
+		pid = child
+	}
+}
+
+// Count walks the leaf chain and counts entries. O(n); tests and stats only.
+func (t *Tree) Count() (int, error) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	pid, err := t.findLeftmostLeaf()
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for pid != storage.InvalidPageID {
+		h, err := t.pool.FetchRead(pid)
+		if err != nil {
+			return 0, err
+		}
+		n += int(h.Page().NumSlots())
+		next := h.Page().NextPage()
+		h.Release()
+		pid = next
+	}
+	return n, nil
+}
+
+// Validate checks the tree invariants: keys sorted within every node, every
+// separator key consistent with the subtree below it, all leaves at the same
+// depth, and the leaf chain in key order. Tests call it after every mutation
+// burst - structural bugs in a B+tree are otherwise very good at hiding.
+func (t *Tree) Validate() error {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	root, err := t.rootID()
+	if err != nil {
+		return err
+	}
+	depth := -1
+	if err := t.validateNode(root, nil, nil, 0, &depth); err != nil {
+		return err
+	}
+	// Leaf chain must be sorted and connected.
+	pid, err := t.findLeftmostLeaf()
+	if err != nil {
+		return err
+	}
+	var prevKey []byte
+	var prevID storage.PageID = storage.InvalidPageID
+	for pid != storage.InvalidPageID {
+		h, err := t.pool.FetchRead(pid)
+		if err != nil {
+			return err
+		}
+		p := h.Page()
+		if p.PrevPage() != prevID {
+			h.Release()
+			return fmt.Errorf("%w: leaf %v prev=%v expected %v", ErrCorruptTree, pid, p.PrevPage(), prevID)
+		}
+		for i := uint16(0); i < p.NumSlots(); i++ {
+			e, err := p.Get(i)
+			if err != nil {
+				h.Release()
+				return err
+			}
+			k := leafKey(e)
+			if prevKey != nil && bytes.Compare(prevKey, k) > 0 {
+				h.Release()
+				return fmt.Errorf("%w: leaf chain out of order at %v", ErrCorruptTree, pid)
+			}
+			prevKey = append([]byte(nil), k...)
+		}
+		prevID = pid
+		pid = p.NextPage()
+		h.Release()
+	}
+	return nil
+}
