@@ -152,3 +152,126 @@ func TestHeapDeleteAndReuse(t *testing.T) {
 		t.Fatalf("heap grew from %d to %d pages instead of reusing freed space", before.Pages, after.Pages)
 	}
 }
+
+func TestHeapUpdateInPlaceAndRelocation(t *testing.T) {
+	h := newHarness(t, 16)
+	hp := newHeap(t, h)
+
+	rid, err := hp.Insert(h.ctx, storage.Record("small"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Same size or smaller: the RID must not move, because indexes point at it.
+	newRID, err := hp.Update(h.ctx, rid, storage.Record("tiny"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newRID != rid {
+		t.Fatalf("shrinking update moved the record from %v to %v", rid, newRID)
+	}
+	if got, _ := hp.Get(rid); string(got) != "tiny" {
+		t.Fatalf("got %q", got)
+	}
+
+	// Fill the page so that a growing update cannot stay put.
+	filler := bytes.Repeat([]byte("f"), 500)
+	for {
+		st, _ := hp.Stats()
+		if st.Pages > 1 {
+			break
+		}
+		if _, err := hp.Insert(h.ctx, filler); err != nil {
+			t.Fatal(err)
+		}
+	}
+	big := bytes.Repeat([]byte("B"), 2000)
+	moved, err := hp.Update(h.ctx, rid, big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if moved == rid {
+		t.Log("record happened to fit in place")
+	} else {
+		if _, err := hp.Get(rid); err == nil {
+			t.Fatal("old RID still resolves after relocation")
+		}
+	}
+	got, err := hp.Get(moved)
+	if err != nil || !bytes.Equal(got, big) {
+		t.Fatalf("relocated record: %d bytes, %v", len(got), err)
+	}
+}
+
+func TestHeapScan(t *testing.T) {
+	h := newHarness(t, 16)
+	hp := newHeap(t, h)
+
+	const n = 2000
+	want := map[string]bool{}
+	rids := make([]storage.RID, n)
+	for i := 0; i < n; i++ {
+		rid, _ := hp.Insert(h.ctx, rec(i))
+		rids[i] = rid
+		want[string(rec(i))] = true
+	}
+	// Delete a few: a scan must skip tombstones.
+	for i := 0; i < n; i += 7 {
+		hp.Delete(h.ctx, rids[i])
+		delete(want, string(rec(i)))
+	}
+
+	seen := map[string]bool{}
+	s := hp.Scan()
+	for s.Next() {
+		row := s.Row()
+		if seen[string(row.Record)] {
+			t.Fatalf("scan returned %q twice", row.Record)
+		}
+		seen[string(row.Record)] = true
+		// The RID a scan reports must resolve to the same record.
+		got, err := hp.Get(row.RID)
+		if err != nil || !bytes.Equal(got, row.Record) {
+			t.Fatalf("scan RID %v does not resolve: %q %v", row.RID, got, err)
+		}
+	}
+	if s.Err() != nil {
+		t.Fatal(s.Err())
+	}
+	if len(seen) != len(want) {
+		t.Fatalf("scan saw %d records, want %d", len(seen), len(want))
+	}
+	for k := range want {
+		if !seen[k] {
+			t.Fatalf("scan missed %q", k)
+		}
+	}
+}
+
+func TestHeapReopen(t *testing.T) {
+	h := newHarness(t, 16)
+	hp := newHeap(t, h)
+	meta := hp.MetaPage()
+	for i := 0; i < 3000; i++ {
+		if _, err := hp.Insert(h.ctx, rec(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.pool.FlushAllPages(); err != nil {
+		t.Fatal(err)
+	}
+	hp2, err := Open(h.pool, meta, "users", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := hp2.Count()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3000 {
+		t.Fatalf("reopened heap has %d records", n)
+	}
+	// And it can still be appended to, on the tail page it recovered.
+	if _, err := hp2.Insert(h.ctx, rec(999999)); err != nil {
+		t.Fatal(err)
+	}
+}
