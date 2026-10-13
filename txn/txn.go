@@ -273,3 +273,78 @@ func (m *Manager) Commit(t *Txn) error {
 	m.commits.Add(1)
 	return nil
 }
+
+// Abort rolls the transaction back: undo its changes (writing compensation
+// records as it goes), then release its locks.
+func (m *Manager) Abort(t *Txn) error {
+	if t == nil {
+		return ErrUnknownTxn
+	}
+	if s := t.State(); s == StateCommitted || s == StateAborted {
+		return nil
+	}
+	m.mu.Lock()
+	u := m.undoer
+	m.mu.Unlock()
+
+	var undoErr error
+	if u != nil && !t.readOnly {
+		undoErr = u.Rollback(t)
+	}
+	if !t.readOnly {
+		if lsn, err := m.log.Append(&wal.Record{TxnID: t.id, Type: wal.TypeAbort, PrevLSN: t.LastLSN()}); err == nil {
+			t.SetLastLSN(lsn)
+		}
+		if lsn, err := m.log.Append(&wal.Record{TxnID: t.id, Type: wal.TypeEnd, PrevLSN: t.LastLSN()}); err == nil {
+			t.SetLastLSN(lsn)
+		}
+	}
+	t.setState(StateAborted)
+	m.locks.ReleaseAll(t)
+	m.forget(t)
+	m.aborts.Add(1)
+	return undoErr
+}
+
+func (m *Manager) forget(t *Txn) {
+	m.mu.Lock()
+	delete(m.active, t.id)
+	m.mu.Unlock()
+}
+
+// Active returns the ids and undo chain heads of the running transactions.
+// The checkpoint writes this out as the "active transaction table".
+func (m *Manager) Active() map[ID]wal.LSN {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[ID]wal.LSN, len(m.active))
+	for id, t := range m.active {
+		out[id] = t.LastLSN()
+	}
+	return out
+}
+
+// ActiveCount is the number of running transactions.
+func (m *Manager) ActiveCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.active)
+}
+
+// AbortAll rolls back everything still running (used by Close).
+func (m *Manager) AbortAll() {
+	m.mu.Lock()
+	txns := make([]*Txn, 0, len(m.active))
+	for _, t := range m.active {
+		txns = append(txns, t)
+	}
+	m.mu.Unlock()
+	for _, t := range txns {
+		_ = m.Abort(t)
+	}
+}
+
+// Stats returns commit/abort counters.
+func (m *Manager) Stats() (commits, aborts int64, deadlocks int) {
+	return m.commits.Load(), m.aborts.Load(), m.locks.Deadlocks()
+}
