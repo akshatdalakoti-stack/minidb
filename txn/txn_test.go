@@ -2,6 +2,7 @@ package txn
 
 import (
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -166,5 +167,78 @@ func TestDeadlockIsDetectedAndBroken(t *testing.T) {
 	}
 	if lm.Deadlocks() == 0 {
 		t.Fatal("deadlock not counted")
+	}
+}
+
+func TestLockTimeout(t *testing.T) {
+	lg, err := wal.Open(filepath.Join(t.TempDir(), "t.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lg.Close()
+	m := NewManager(lg, 100*time.Millisecond, 1)
+	lm := m.Locks()
+	key := TableKey(7)
+
+	a, _ := m.Begin()
+	lm.Acquire(a, key, LockExclusive)
+	b, _ := m.Begin()
+	start := time.Now()
+	if err := lm.Acquire(b, key, LockExclusive); err != ErrLockTimeout {
+		t.Fatalf("want ErrLockTimeout got %v", err)
+	}
+	if time.Since(start) < 50*time.Millisecond {
+		t.Fatal("timeout fired too early")
+	}
+	m.Commit(a)
+	m.Abort(b)
+}
+
+func TestLocksReleasedOnEnd(t *testing.T) {
+	m := newManager(t)
+	lm := m.Locks()
+	key := TableKey(3)
+	a, _ := m.Begin()
+	lm.Acquire(a, key, LockExclusive)
+	if e, _ := lm.Stats(); e == 0 {
+		t.Fatal("lock table empty while a lock is held")
+	}
+	m.Commit(a)
+	if e, w := lm.Stats(); e != 0 || w != 0 {
+		t.Fatalf("lock table not cleaned up: entries=%d waiters=%d", e, w)
+	}
+}
+
+func TestConcurrentLockChurn(t *testing.T) {
+	m := newManager(t)
+	lm := m.Locks()
+	var wg sync.WaitGroup
+	for g := 0; g < 16; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				tx, err := m.Begin()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				key := RowKey(1, storage.RID{PageID: storage.PageID((g + i) % 4), Slot: 0})
+				mode := LockShared
+				if i%3 == 0 {
+					mode = LockExclusive
+				}
+				if err := lm.Acquire(tx, key, mode); err != nil {
+					// A deadlock or timeout is a legal outcome; roll back.
+					m.Abort(tx)
+					continue
+				}
+				m.Commit(tx)
+			}
+		}(g)
+	}
+	wg.Wait()
+	if e, w := lm.Stats(); e != 0 || w != 0 {
+		t.Fatalf("locks leaked: entries=%d waiters=%d", e, w)
 	}
 }
