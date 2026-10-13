@@ -1001,3 +1001,115 @@ type Iterator struct {
 	done    bool
 	err     error
 }
+
+type kv struct {
+	key []byte
+	rid storage.RID
+}
+
+const scanBatch = 256
+
+// Scan returns an iterator over [start, end). A nil start means "from the
+// beginning"; a nil end means "to the end".
+func (t *Tree) Scan(start, end []byte) *Iterator {
+	it := &Iterator{tree: t, end: end}
+	if start != nil {
+		it.lastKey = append([]byte(nil), start...)
+	}
+	return it
+}
+
+// Next advances the iterator. It returns false at the end of the range or on
+// error (check Err).
+func (it *Iterator) Next() bool {
+	if it.done {
+		return false
+	}
+	if it.pos < len(it.batch) {
+		e := it.batch[it.pos]
+		it.pos++
+		it.lastKey, it.lastRID, it.started = e.key, e.rid, true
+		return true
+	}
+	if err := it.fill(); err != nil {
+		it.err = err
+		it.done = true
+		return false
+	}
+	if len(it.batch) == 0 {
+		it.done = true
+		return false
+	}
+	return it.Next()
+}
+
+// fill loads the next batch of entries, starting just after the last one
+// returned.
+func (it *Iterator) fill() error {
+	t := it.tree
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	it.batch = it.batch[:0]
+	it.pos = 0
+
+	var leafID storage.PageID
+	var err error
+	if it.lastKey == nil {
+		leafID, err = t.findLeftmostLeaf()
+	} else {
+		leafID, err = t.findLeaf(lowKey(it.lastKey))
+	}
+	if err != nil {
+		return err
+	}
+
+	for leafID != storage.InvalidPageID && len(it.batch) < scanBatch {
+		h, err := t.pool.FetchRead(leafID)
+		if err != nil {
+			return err
+		}
+		p := h.Page()
+		start := uint16(0)
+		if it.lastKey != nil {
+			start, err = leafLowerBound(p, it.lastKey)
+			if err != nil {
+				h.Release()
+				return err
+			}
+		}
+		for i := start; i < p.NumSlots() && len(it.batch) < scanBatch; i++ {
+			e, err := p.Get(i)
+			if err != nil {
+				h.Release()
+				return err
+			}
+			key, rid := leafKey(e), leafRID(e)
+			// Skip everything up to and including the last entry we returned.
+			if it.started {
+				if c := bytes.Compare(key, it.lastKey); c < 0 {
+					continue
+				} else if c == 0 && rid.Compare(it.lastRID) <= 0 {
+					continue
+				}
+			}
+			if it.end != nil && bytes.Compare(key, it.end) >= 0 {
+				h.Release()
+				return nil // past the end of the range
+			}
+			it.batch = append(it.batch, kv{append([]byte(nil), key...), rid})
+		}
+		next := p.NextPage()
+		h.Release()
+		if len(it.batch) >= scanBatch {
+			return nil
+		}
+		leafID = next
+		if leafID != storage.InvalidPageID && len(it.batch) > 0 {
+			// Continue into the next leaf from its very beginning.
+			last := it.batch[len(it.batch)-1]
+			it.lastKey, it.lastRID, it.started = last.key, last.rid, true
+		}
+	}
+	return nil
+}
