@@ -181,3 +181,97 @@ func (lm *LockManager) Acquire(t *Txn, key Key, mode Mode) error {
 	}
 	return lm.waitFor(t, key, mode, e)
 }
+
+// grantable reports whether a request can be satisfied immediately. Waiters
+// ahead in the queue block new requests, which keeps writers from starving.
+func (lm *LockManager) grantable(e *lockEntry, id ID, mode Mode) bool {
+	for h, hm := range e.holders {
+		if h == id {
+			continue
+		}
+		if !compatible(hm, mode) {
+			return false
+		}
+	}
+	if len(e.waiters) > 0 && mode == LockShared {
+		// Only jump the queue if every waiter is also a reader.
+		for _, w := range e.waiters {
+			if w.mode == LockExclusive {
+				return false
+			}
+		}
+	}
+	return len(e.waiters) == 0 || mode == LockShared
+}
+
+// waitFor enqueues the request and blocks. Called with lm.mu held; it always
+// releases it.
+func (lm *LockManager) waitFor(t *Txn, key Key, mode Mode, e *lockEntry) error {
+	w := &waiter{txn: t, mode: mode, ch: make(chan error, 1)}
+	e.waiters = append(e.waiters, w)
+	lm.waitingOn[t.ID()] = key
+
+	if victim := lm.detectDeadlock(t.ID()); victim != 0 {
+		lm.deadlocks++
+		if victim == t.ID() {
+			lm.removeWaiter(e, w)
+			delete(lm.waitingOn, t.ID())
+			lm.mu.Unlock()
+			t.markAborting()
+			return ErrDeadlock
+		}
+		lm.abortVictimLocked(victim)
+	}
+	lm.mu.Unlock()
+
+	select {
+	case err := <-w.ch:
+		return err
+	case <-time.After(lm.timeout):
+		lm.mu.Lock()
+		// The grant may have arrived while the timer was firing.
+		select {
+		case err := <-w.ch:
+			lm.mu.Unlock()
+			return err
+		default:
+		}
+		lm.removeWaiter(e, w)
+		delete(lm.waitingOn, t.ID())
+		lm.mu.Unlock()
+		return ErrLockTimeout
+	}
+}
+
+func (lm *LockManager) removeWaiter(e *lockEntry, w *waiter) {
+	for i, x := range e.waiters {
+		if x == w {
+			e.waiters = append(e.waiters[:i], e.waiters[i+1:]...)
+			return
+		}
+	}
+}
+
+// abortVictimLocked marks a transaction as doomed and, if it is blocked, wakes
+// it up with ErrDeadlock.
+func (lm *LockManager) abortVictimLocked(victim ID) {
+	if t := lm.txns[victim]; t != nil {
+		t.markAborting()
+	}
+	key, waiting := lm.waitingOn[victim]
+	if !waiting {
+		return // it is running; it will notice when it next asks for a lock
+	}
+	e := lm.table[key]
+	if e == nil {
+		return
+	}
+	for i, w := range e.waiters {
+		if w.txn.ID() == victim {
+			e.waiters = append(e.waiters[:i], e.waiters[i+1:]...)
+			delete(lm.waitingOn, victim)
+			w.ch <- ErrDeadlock
+			return
+		}
+	}
+}
