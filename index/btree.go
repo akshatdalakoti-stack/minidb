@@ -900,3 +900,104 @@ func (t *Tree) merge(ctx pageops.Ctx, parent *buffer.Handle, sepIdx int, left, r
 	}
 	return ctx.DeleteShift(parent, uint16(sepIdx))
 }
+
+// borrow moves one entry across the sibling boundary and fixes the separator.
+func (t *Tree) borrow(ctx pageops.Ctx, parent *buffer.Handle, sepIdx int, left, right *buffer.Handle) error {
+	lp, rp := left.Page(), right.Page()
+	sepEntry, err := parent.Page().Get(uint16(sepIdx))
+	if err != nil {
+		return err
+	}
+	sepKey := append([]byte(nil), internalKey(sepEntry)...)
+
+	if lp.UsedSpace() < rp.UsedSpace() {
+		if rp.NumSlots() < 2 {
+			return nil // donor cannot spare an entry; leave the node under-full
+		}
+		// Move the right node's first entry to the end of the left node.
+		first, err := rp.Get(0)
+		if err != nil {
+			return err
+		}
+		e := append([]byte(nil), first...)
+		var newSep []byte
+		if isLeaf(lp) {
+			if err := ctx.InsertShift(left, lp.NumSlots(), e); err != nil {
+				return err
+			}
+			next, err := rp.Get(1)
+			if err != nil {
+				return err
+			}
+			newSep = append([]byte(nil), next...)
+		} else {
+			// Internal: the separator descends into the left node paired with
+			// the right node's leftmost child, and the moved key becomes the
+			// new separator.
+			if err := ctx.InsertShift(left, lp.NumSlots(), internalEntry(sepKey, storage.PageID(rp.Extra()))); err != nil {
+				return err
+			}
+			if err := ctx.SetExtra(right, uint32(internalChild(e))); err != nil {
+				return err
+			}
+			newSep = append([]byte(nil), internalKey(e)...)
+		}
+		if err := ctx.DeleteShift(right, 0); err != nil {
+			return err
+		}
+		return replaceEntry(ctx, parent, uint16(sepIdx), internalEntry(newSep, right.ID()))
+	}
+
+	// Move the left node's last entry to the front of the right node.
+	if lp.NumSlots() < 2 {
+		return nil
+	}
+	lastIdx := lp.NumSlots() - 1
+	last, err := lp.Get(lastIdx)
+	if err != nil {
+		return err
+	}
+	e := append([]byte(nil), last...)
+	var newSep []byte
+	if isLeaf(lp) {
+		if err := ctx.InsertShift(right, 0, e); err != nil {
+			return err
+		}
+		newSep = append([]byte(nil), e...)
+	} else {
+		if err := ctx.InsertShift(right, 0, internalEntry(sepKey, storage.PageID(rp.Extra()))); err != nil {
+			return err
+		}
+		if err := ctx.SetExtra(right, uint32(internalChild(e))); err != nil {
+			return err
+		}
+		newSep = append([]byte(nil), internalKey(e)...)
+	}
+	if err := ctx.DeleteShift(left, lastIdx); err != nil {
+		return err
+	}
+	return replaceEntry(ctx, parent, uint16(sepIdx), internalEntry(newSep, right.ID()))
+}
+
+// --- range scan ------------------------------------------------------------
+
+// Iterator walks the leaf chain in key order.
+//
+// It deliberately does not hold the tree lock between calls to Next: a scan can
+// last for a long time and blocking every writer for its duration would be a
+// terrible trade. Instead it copies a batch of entries out of the current leaf
+// under a read lock, serves Next from that buffer, and re-positions itself by
+// key when the buffer runs dry. A concurrent split or merge therefore cannot
+// corrupt a scan; at worst the scan sees a value that was inserted after it
+// started.
+type Iterator struct {
+	tree    *Tree
+	end     []byte // exclusive upper bound; nil means "to the end"
+	batch   []kv
+	pos     int
+	lastKey []byte
+	lastRID storage.RID
+	started bool
+	done    bool
+	err     error
+}
