@@ -357,3 +357,110 @@ type Scanner struct {
 	pos   int
 	err   error
 }
+
+// Scan returns a scanner positioned before the first record.
+func (hp *Heap) Scan() *Scanner {
+	hp.mu.Lock()
+	first := hp.first
+	hp.mu.Unlock()
+	return &Scanner{heap: hp, next: first}
+}
+
+// Next advances to the next record.
+func (s *Scanner) Next() bool {
+	for {
+		if s.pos < len(s.batch) {
+			s.pos++
+			return true
+		}
+		if s.next == storage.InvalidPageID {
+			return false
+		}
+		if err := s.fill(); err != nil {
+			s.err = err
+			return false
+		}
+	}
+}
+
+func (s *Scanner) fill() error {
+	s.batch = s.batch[:0]
+	s.pos = 0
+	for s.next != storage.InvalidPageID && len(s.batch) == 0 {
+		h, err := s.heap.pool.FetchRead(s.next)
+		if err != nil {
+			return err
+		}
+		p := h.Page()
+		pid := s.next
+		for i := uint16(0); i < p.NumSlots(); i++ {
+			rec, err := p.Get(i)
+			if err != nil {
+				continue // tombstone
+			}
+			s.batch = append(s.batch, Row{
+				RID:    storage.RID{PageID: pid, Slot: i},
+				Record: append(storage.Record(nil), rec...),
+			})
+		}
+		s.next = p.NextPage()
+		h.Release()
+	}
+	return nil
+}
+
+// Row returns the current row. Valid after Next returned true.
+func (s *Scanner) Row() Row { return s.batch[s.pos-1] }
+
+// Err returns the error that stopped the scan.
+func (s *Scanner) Err() error { return s.err }
+
+// --- statistics ------------------------------------------------------------
+
+// Stats describes the physical shape of the heap.
+type Stats struct {
+	Pages     int
+	Records   int
+	LiveBytes int
+	FreeBytes int
+}
+
+// Fill is the fraction of the heap's pages occupied by live records.
+func (s Stats) Fill() float64 {
+	if s.Pages == 0 {
+		return 0
+	}
+	return float64(s.LiveBytes) / float64(s.Pages*storage.PageSize)
+}
+
+// Stats walks the page chain and measures it. O(pages).
+func (hp *Heap) Stats() (Stats, error) {
+	var st Stats
+	hp.mu.Lock()
+	pid := hp.first
+	hp.mu.Unlock()
+	for pid != storage.InvalidPageID {
+		h, err := hp.pool.FetchRead(pid)
+		if err != nil {
+			return st, err
+		}
+		p := h.Page()
+		st.Pages++
+		st.FreeBytes += p.FreeSpace() + p.DeadSpace()
+		for i := uint16(0); i < p.NumSlots(); i++ {
+			if rec, err := p.Get(i); err == nil {
+				st.Records++
+				st.LiveBytes += len(rec)
+			}
+		}
+		pid = p.NextPage()
+		h.Release()
+	}
+	return st, nil
+}
+
+// Count returns the number of live records. O(pages).
+func (hp *Heap) Count() (int, error) {
+	st, err := hp.Stats()
+	return st.Records, err
+}
