@@ -780,3 +780,123 @@ func (t *Tree) deleteFrom(ctx pageops.Ctx, pid storage.PageID, key []byte, rid s
 	h.Release()
 	return true, err
 }
+
+// rebalance restores the occupancy invariant for a child that may have become
+// too empty, by borrowing an entry from a sibling or merging with one.
+func (t *Tree) rebalance(ctx pageops.Ctx, parent *buffer.Handle, childIdx int, childID storage.PageID) error {
+	ch, err := t.pool.FetchWrite(childID)
+	if err != nil {
+		return err
+	}
+	if ch.Page().UsedSpace() >= mergeThreshold {
+		ch.Release()
+		return nil
+	}
+	pp := parent.Page()
+	nSlots := int(pp.NumSlots())
+
+	// Prefer the right sibling; it makes the index bookkeeping simpler.
+	if childIdx+1 < nSlots {
+		sibID, err := childAt(pp, childIdx+1)
+		if err != nil {
+			ch.Release()
+			return err
+		}
+		sh, err := t.pool.FetchWrite(sibID)
+		if err != nil {
+			ch.Release()
+			return err
+		}
+		err = t.mergeOrBorrowRight(ctx, parent, childIdx+1, ch, sh)
+		sh.Release()
+		ch.Release()
+		return err
+	}
+	if childIdx >= 0 {
+		sibID, err := childAt(pp, childIdx-1)
+		if err != nil {
+			ch.Release()
+			return err
+		}
+		sh, err := t.pool.FetchWrite(sibID)
+		if err != nil {
+			ch.Release()
+			return err
+		}
+		// Left sibling: the roles swap - the sibling is the left node and the
+		// child is the right one, separated by the entry at childIdx.
+		err = t.mergeOrBorrowRight(ctx, parent, childIdx, sh, ch)
+		sh.Release()
+		ch.Release()
+		return err
+	}
+	return nil // only child of the root: nothing to balance against
+}
+
+// mergeOrBorrowRight handles a (left, right) sibling pair whose separator is
+// the parent entry at sepIdx.
+func (t *Tree) mergeOrBorrowRight(ctx pageops.Ctx, parent *buffer.Handle, sepIdx int, left, right *buffer.Handle) error {
+	lp, rp := left.Page(), right.Page()
+	if lp.UsedSpace()+rp.UsedSpace() <= nodeCapacity-storage.PageHeaderSize {
+		return t.merge(ctx, parent, sepIdx, left, right)
+	}
+	return t.borrow(ctx, parent, sepIdx, left, right)
+}
+
+// merge folds the right node into the left one and removes the separator from
+// the parent.
+//
+// The emptied page is deliberately not returned to the disk free list: log
+// records that mention it may still be replayed by recovery, and handing the
+// page straight back to the allocator would let those replays land on whatever
+// object gets the page next. Leaving it allocated but unreachable is safe and
+// costs only space. DESIGN.md records this as a known limitation.
+func (t *Tree) merge(ctx pageops.Ctx, parent *buffer.Handle, sepIdx int, left, right *buffer.Handle) error {
+	lp, rp := left.Page(), right.Page()
+	sepEntry, err := parent.Page().Get(uint16(sepIdx))
+	if err != nil {
+		return err
+	}
+	sepKey := append([]byte(nil), internalKey(sepEntry)...)
+
+	if !isLeaf(lp) {
+		// For internal nodes the separator comes back down and pairs up with
+		// the right node's leftmost child.
+		if err := ctx.InsertShift(left, lp.NumSlots(), internalEntry(sepKey, storage.PageID(rp.Extra()))); err != nil {
+			return err
+		}
+	}
+	entries, err := collectEntries(rp)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if err := ctx.InsertShift(left, lp.NumSlots(), e); err != nil {
+			return err
+		}
+	}
+	for i := int(rp.NumSlots()) - 1; i >= 0; i-- {
+		if err := ctx.DeleteShift(right, uint16(i)); err != nil {
+			return err
+		}
+	}
+	if isLeaf(lp) {
+		// Unlink the emptied leaf from the sibling chain.
+		next := rp.NextPage()
+		if err := ctx.SetNext(left, next); err != nil {
+			return err
+		}
+		if next != storage.InvalidPageID {
+			nh, err := t.pool.FetchWrite(next)
+			if err != nil {
+				return err
+			}
+			err = ctx.SetPrev(nh, left.ID())
+			nh.Release()
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return ctx.DeleteShift(parent, uint16(sepIdx))
+}
