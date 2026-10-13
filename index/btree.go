@@ -688,3 +688,95 @@ func (t *Tree) Delete(ctx pageops.Ctx, key []byte, rid storage.RID) (bool, error
 	}
 	return true, t.shrinkRoot(sctx)
 }
+
+// deleteUnlogged is the physical delete used by rollback and recovery.
+func (t *Tree) deleteUnlogged(ctx pageops.Ctx, key []byte, rid storage.RID) (bool, error) {
+	root, err := t.rootID()
+	if err != nil {
+		return false, err
+	}
+	found, err := t.deleteFrom(ctx, root, key, rid)
+	if err != nil || !found {
+		return found, err
+	}
+	return true, t.shrinkRoot(ctx)
+}
+
+// UndoInsert and UndoDelete are the logical inverses used when a transaction
+// rolls back or when recovery undoes a loser. They do the tree work but log
+// only redo-only structural records: the caller writes the compensation record
+// that moves the transaction's undo cursor past the original operation.
+func (t *Tree) UndoInsert(ctx pageops.Ctx, key []byte, rid storage.RID) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, err := t.deleteUnlogged(ctx.Structural(), key, rid)
+	return err
+}
+
+func (t *Tree) UndoDelete(ctx pageops.Ctx, key []byte, rid storage.RID) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.insertUnlogged(ctx.Structural(), key, rid)
+}
+
+// shrinkRoot collapses a root that has lost all its separators: its only
+// remaining child becomes the new root and the tree loses a level.
+func (t *Tree) shrinkRoot(ctx pageops.Ctx) error {
+	root, err := t.rootID()
+	if err != nil {
+		return err
+	}
+	h, err := t.pool.FetchRead(root)
+	if err != nil {
+		return err
+	}
+	p := h.Page()
+	if isLeaf(p) || p.NumSlots() > 0 {
+		h.Release()
+		return nil
+	}
+	only := storage.PageID(p.Extra())
+	h.Release()
+	if only == storage.InvalidPageID {
+		return ErrCorruptTree
+	}
+	metaH, err := t.pool.FetchWrite(t.meta)
+	if err != nil {
+		return err
+	}
+	defer metaH.Release()
+	return ctx.SetExtra(metaH, uint32(only))
+}
+
+func (t *Tree) deleteFrom(ctx pageops.Ctx, pid storage.PageID, key []byte, rid storage.RID) (bool, error) {
+	h, err := t.pool.FetchWrite(pid)
+	if err != nil {
+		return false, err
+	}
+	p := h.Page()
+
+	if isLeaf(p) {
+		idx, found, err := leafSearch(p, key, rid)
+		if err != nil || !found {
+			h.Release()
+			return false, err
+		}
+		err = ctx.DeleteShift(h, idx)
+		h.Release()
+		return err == nil, err
+	}
+
+	child, childIdx, err := childFor(p, leafEntry(key, rid))
+	if err != nil {
+		h.Release()
+		return false, err
+	}
+	found, err := t.deleteFrom(ctx, child, key, rid)
+	if err != nil || !found {
+		h.Release()
+		return found, err
+	}
+	err = t.rebalance(ctx, h, childIdx, child)
+	h.Release()
+	return true, err
+}
