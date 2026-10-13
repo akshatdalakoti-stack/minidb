@@ -1227,3 +1227,79 @@ func (t *Tree) Validate() error {
 	}
 	return nil
 }
+
+func (t *Tree) validateNode(pid storage.PageID, lo, hi []byte, level int, leafDepth *int) error {
+	if level > 64 {
+		return ErrCorruptTree
+	}
+	h, err := t.pool.FetchRead(pid)
+	if err != nil {
+		return err
+	}
+	defer h.Release()
+	p := h.Page()
+	if err := p.Validate(); err != nil {
+		return err
+	}
+
+	var prev []byte
+	for i := uint16(0); i < p.NumSlots(); i++ {
+		e, err := p.Get(i)
+		if err != nil {
+			return err
+		}
+		var k []byte
+		if isLeaf(p) {
+			k = e // composite: key||RID, same form as a separator
+		} else {
+			k = internalKey(e)
+		}
+		if prev != nil && bytes.Compare(prev, k) > 0 {
+			return fmt.Errorf("%w: node %v keys out of order", ErrCorruptTree, pid)
+		}
+		if lo != nil && bytes.Compare(k, lo) < 0 {
+			return fmt.Errorf("%w: node %v key below its subtree bound", ErrCorruptTree, pid)
+		}
+		if hi != nil && bytes.Compare(k, hi) >= 0 {
+			return fmt.Errorf("%w: node %v key above its subtree bound", ErrCorruptTree, pid)
+		}
+		prev = append([]byte(nil), k...)
+	}
+
+	if isLeaf(p) {
+		if *leafDepth == -1 {
+			*leafDepth = level
+		} else if *leafDepth != level {
+			return fmt.Errorf("%w: leaves at different depths (%d and %d)", ErrCorruptTree, *leafDepth, level)
+		}
+		return nil
+	}
+
+	// Recurse into every child with tightened bounds.
+	prevKey := lo
+	child, err := childAt(p, -1)
+	if err != nil {
+		return err
+	}
+	for i := 0; i <= int(p.NumSlots()); i++ {
+		var upper []byte
+		if i < int(p.NumSlots()) {
+			e, err := p.Get(uint16(i))
+			if err != nil {
+				return err
+			}
+			upper = internalKey(e)
+		} else {
+			upper = hi
+		}
+		if err := t.validateNode(child, prevKey, upper, level+1, leafDepth); err != nil {
+			return err
+		}
+		if i < int(p.NumSlots()) {
+			e, _ := p.Get(uint16(i))
+			prevKey = internalKey(e)
+			child = internalChild(e)
+		}
+	}
+	return nil
+}
