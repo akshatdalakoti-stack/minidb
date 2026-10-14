@@ -2,6 +2,7 @@ package db
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -556,4 +557,193 @@ func TestRecoveryUndoesUncommittedWork(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestRecoveryIsIdempotent(t *testing.T) {
+	// Crash, recover, crash again during the next run, recover again: the
+	// answer must be the same every time.
+	dir := t.TempDir()
+	d := openTestDB(t, dir)
+	tb, _ := d.CreateTable("users", usersSchema())
+	d.Update(func(tx *txn.Txn) error {
+		for i := 0; i < 200; i++ {
+			if _, err := d.Insert(tx, tb, userRow(i)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	loser, _ := d.Begin()
+	d.Insert(loser, tb, userRow(9999))
+	d.Pool().FlushAllPages()
+	d.SimulateCrash()
+
+	for round := 0; round < 3; round++ {
+		d2 := openTestDB(t, dir)
+		tb2, _ := d2.Table("users")
+		n, _ := d2.Count(tb2)
+		if n != 200 {
+			t.Fatalf("round %d: %d rows, want 200", round, n)
+		}
+		if round < 2 {
+			d2.SimulateCrash()
+		} else {
+			d2.Close()
+		}
+	}
+}
+
+func TestRecoveryAfterManyTransactions(t *testing.T) {
+	dir := t.TempDir()
+	d := openTestDB(t, dir)
+	tb, _ := d.CreateTable("users", usersSchema())
+	tb, _ = d.CreateIndex("users", "users_by_id", "id", false)
+
+	committed := 0
+	for i := 0; i < 200; i++ {
+		tx, _ := d.Begin()
+		if _, err := d.Insert(tx, tb, userRow(i)); err != nil {
+			t.Fatal(err)
+		}
+		if i%3 == 0 {
+			// Every third transaction rolls back.
+			if err := d.Abort(tx); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if err := d.Commit(tx); err != nil {
+			t.Fatal(err)
+		}
+		committed++
+	}
+	d.SimulateCrash()
+
+	d2 := openTestDB(t, dir)
+	defer d2.Close()
+	tb2, _ := d2.Table("users")
+	n, _ := d2.Count(tb2)
+	if n != committed {
+		t.Fatalf("%d rows after recovery, want %d", n, committed)
+	}
+	// Index and heap must agree.
+	if err := d2.View(func(tx *txn.Txn) error {
+		return d2.Scan(tx, tb2, func(r ScanRow) error {
+			rows, err := d2.IndexLookup(tx, tb2, "id", r.Row[0])
+			if err != nil {
+				return err
+			}
+			if len(rows) != 1 {
+				return fmt.Errorf("id %v: heap has the row, index has %d entries", r.Row[0], len(rows))
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCheckpointShortensRecovery(t *testing.T) {
+	dir := t.TempDir()
+	d := openTestDB(t, dir)
+	tb, _ := d.CreateTable("users", usersSchema())
+	d.Update(func(tx *txn.Txn) error {
+		for i := 0; i < 500; i++ {
+			if _, err := d.Insert(tx, tb, userRow(i)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err := d.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	// Only this work is after the checkpoint.
+	d.Update(func(tx *txn.Txn) error {
+		_, err := d.Insert(tx, tb, userRow(1000))
+		return err
+	})
+	d.SimulateCrash()
+
+	d2 := openTestDB(t, dir)
+	defer d2.Close()
+	rep := d2.Report()
+	t.Log(rep)
+	if rep.StartLSN == 0 {
+		t.Fatal("recovery started from the beginning of the log despite the checkpoint")
+	}
+	if rep.RecordsScanned > 200 {
+		t.Fatalf("recovery scanned %d records; the checkpoint should have cut that down", rep.RecordsScanned)
+	}
+	tb2, _ := d2.Table("users")
+	if n, _ := d2.Count(tb2); n != 501 {
+		t.Fatalf("%d rows after recovery, want 501", n)
+	}
+}
+
+// --- Phase 10: concurrency -------------------------------------------------
+
+func TestConcurrentTransactions(t *testing.T) {
+	d := openTestDB(t, t.TempDir())
+	defer d.Close()
+	tb, _ := d.CreateTable("users", usersSchema())
+	tb, _ = d.CreateIndex("users", "users_by_id", "id", false)
+
+	const goroutines = 20
+	const perGoroutine = 50
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	inserted := 0
+	failures := 0
+
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < perGoroutine; i++ {
+				id := g*perGoroutine + i
+				err := d.Update(func(tx *txn.Txn) error {
+					_, err := d.Insert(tx, tb, userRow(id))
+					return err
+				})
+				mu.Lock()
+				if err != nil {
+					failures++
+				} else {
+					inserted++
+				}
+				mu.Unlock()
+			}
+		}(g)
+	}
+	wg.Wait()
+	if failures != 0 {
+		t.Fatalf("%d transactions failed", failures)
+	}
+	n, err := d.Count(tb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != inserted {
+		t.Fatalf("heap holds %d rows, %d were inserted", n, inserted)
+	}
+	// Every row must be findable through the index too.
+	if err := d.View(func(tx *txn.Txn) error {
+		for id := 0; id < goroutines*perGoroutine; id += 37 {
+			rows, err := d.IndexLookup(tx, tb, "id", IntValue(int64(id)))
+			if err != nil {
+				return err
+			}
+			if len(rows) != 1 {
+				return fmt.Errorf("id %d has %d index entries", id, len(rows))
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if s := d.Pool().Stats(); s.Pinned != 0 {
+		t.Fatalf("pins leaked: %v", s)
+	}
+	t.Log(d.Stats())
 }
