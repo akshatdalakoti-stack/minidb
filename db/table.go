@@ -1,6 +1,8 @@
 package db
 
 import (
+	"fmt"
+
 	"minidb/storage"
 	"minidb/txn"
 )
@@ -145,3 +147,95 @@ func (d *DB) DeleteRow(t *txn.Txn, tb *Table, rid storage.RID) error {
 	}
 	return tb.Heap.Delete(ctx, rid)
 }
+
+// ScanRow is one row produced by a scan.
+type ScanRow struct {
+	RID storage.RID
+	Row Row
+}
+
+// Scan walks every row of a table, taking a shared lock on each one. fn may
+// return ErrStopScan to finish early.
+func (d *DB) Scan(t *txn.Txn, tb *Table, fn func(ScanRow) error) error {
+	s := tb.Heap.Scan()
+	for s.Next() {
+		r := s.Row()
+		if err := d.txns.Locks().Acquire(t, txn.RowKey(tb.Def.ID, r.RID), txn.LockShared); err != nil {
+			return err
+		}
+		row, err := DecodeRow(tb.Def.Schema, r.Record)
+		if err != nil {
+			return err
+		}
+		if err := fn(ScanRow{RID: r.RID, Row: row}); err != nil {
+			if err == ErrStopScan {
+				return nil
+			}
+			return err
+		}
+	}
+	return s.Err()
+}
+
+// ErrStopScan ends a scan early without reporting an error.
+var ErrStopScan = fmt.Errorf("db: stop scan")
+
+// IndexLookup finds the rows whose indexed column equals v. This is the point
+// of having an index: it turns a full scan into a tree descent.
+func (d *DB) IndexLookup(t *txn.Txn, tb *Table, column string, v Value) ([]ScanRow, error) {
+	tree, _, ok := tb.IndexOn(column)
+	if !ok {
+		return nil, fmt.Errorf("%w: no index on %s.%s", ErrNoSuchIndex, tb.Def.Name, column)
+	}
+	rids, err := tree.Search(IndexKey(v))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ScanRow, 0, len(rids))
+	for _, rid := range rids {
+		row, err := d.Get(t, tb, rid)
+		if err != nil {
+			// The index can briefly outlive the row it points at if a
+			// concurrent transaction deleted it; skip such entries.
+			continue
+		}
+		out = append(out, ScanRow{RID: rid, Row: row})
+	}
+	return out, nil
+}
+
+// IndexRange scans the rows whose indexed column falls in [lo, hi]. Passing a
+// null bound means "unbounded on that side".
+func (d *DB) IndexRange(t *txn.Txn, tb *Table, column string, lo, hi Value, fn func(ScanRow) error) error {
+	tree, _, ok := tb.IndexOn(column)
+	if !ok {
+		return fmt.Errorf("%w: no index on %s.%s", ErrNoSuchIndex, tb.Def.Name, column)
+	}
+	var start, end []byte
+	if !lo.Null {
+		start = IndexKey(lo)
+	}
+	if !hi.Null {
+		// The tree's upper bound is exclusive; make it inclusive by appending
+		// a byte that sorts after every key with this prefix.
+		end = append(IndexKey(hi), 0xFF)
+	}
+	it := tree.Scan(start, end)
+	for it.Next() {
+		rid := it.RID()
+		row, err := d.Get(t, tb, rid)
+		if err != nil {
+			continue
+		}
+		if err := fn(ScanRow{RID: rid, Row: row}); err != nil {
+			if err == ErrStopScan {
+				return nil
+			}
+			return err
+		}
+	}
+	return it.Err()
+}
+
+// Count returns the number of rows in a table.
+func (d *DB) Count(tb *Table) (int, error) { return tb.Heap.Count() }
