@@ -377,3 +377,116 @@ func (c *Catalog) createTable(ctx pageops.Ctx, name string, schema Schema) (*Tab
 	c.rids[key] = rid
 	return t, nil
 }
+
+// createIndex adds an index to a table and back-fills it from the heap.
+func (c *Catalog) createIndex(ctx pageops.Ctx, tableName, idxName, column string, unique bool) (*Table, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := strings.ToLower(tableName)
+	t, ok := c.tables[key]
+	if !ok {
+		return nil, fmt.Errorf("%w: %q", ErrNoSuchTable, tableName)
+	}
+	col := t.Def.Schema.ColumnIndex(column)
+	if col < 0 {
+		return nil, fmt.Errorf("%w: %q.%q", ErrNoSuchColumn, tableName, column)
+	}
+	for _, d := range t.Def.Indexes {
+		if strings.EqualFold(d.Name, idxName) || strings.EqualFold(d.Column, column) {
+			return nil, fmt.Errorf("%w: %q", ErrIndexExists, idxName)
+		}
+	}
+	tree, err := index.Create(ctx, idxName)
+	if err != nil {
+		return nil, err
+	}
+	// Back-fill: every existing row gets an index entry.
+	s := t.Heap.Scan()
+	for s.Next() {
+		row := s.Row()
+		decoded, err := DecodeRow(t.Def.Schema, row.Record)
+		if err != nil {
+			return nil, err
+		}
+		if err := tree.Insert(ctx, IndexKey(decoded[col]), row.RID); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.Err(); err != nil {
+		return nil, err
+	}
+
+	def := t.Def
+	def.Indexes = append(append([]IndexDef(nil), def.Indexes...), IndexDef{
+		Name: idxName, Column: column, Meta: tree.MetaPage(), Unique: unique,
+	})
+	if err := c.updateDef(ctx, def); err != nil {
+		return nil, err
+	}
+	t.Def = def
+	t.Indexes = append(t.Indexes, tree)
+	return t, nil
+}
+
+// writeDef inserts a table definition into the catalog heap.
+func (c *Catalog) writeDef(ctx pageops.Ctx, def TableDef) (storage.RID, error) {
+	buf, err := json.Marshal(def)
+	if err != nil {
+		return storage.InvalidRID, err
+	}
+	return c.heap.Insert(ctx, buf)
+}
+
+// updateDef rewrites an existing catalog record.
+func (c *Catalog) updateDef(ctx pageops.Ctx, def TableDef) error {
+	key := strings.ToLower(def.Name)
+	rid, ok := c.rids[key]
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrNoSuchTable, def.Name)
+	}
+	buf, err := json.Marshal(def)
+	if err != nil {
+		return err
+	}
+	newRID, err := c.heap.Update(ctx, rid, buf)
+	if err != nil {
+		return err
+	}
+	c.rids[key] = newRID
+	return nil
+}
+
+// dropTable removes a table from the catalog. The heap pages themselves are
+// left allocated (see DESIGN.md: reclaiming pages that log records still
+// mention needs more machinery than it is worth here).
+func (c *Catalog) dropTable(ctx pageops.Ctx, name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := strings.ToLower(name)
+	if _, ok := c.tables[key]; !ok {
+		return fmt.Errorf("%w: %q", ErrNoSuchTable, name)
+	}
+	rid, ok := c.rids[key]
+	if ok {
+		if err := c.heap.Delete(ctx, rid); err != nil {
+			return err
+		}
+	}
+	delete(c.tables, key)
+	delete(c.rids, key)
+	return nil
+}
+
+// indexTrees returns every index tree in the database, keyed by meta page.
+// Recovery uses it to apply logical index undo.
+func (c *Catalog) indexTrees() map[storage.PageID]*index.Tree {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := map[storage.PageID]*index.Tree{}
+	for _, t := range c.tables {
+		for i, d := range t.Def.Indexes {
+			out[d.Meta] = t.Indexes[i]
+		}
+	}
+	return out
+}
