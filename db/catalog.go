@@ -1,11 +1,17 @@
 package db
 
 import (
+	"encoding/binary"
+	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
+
+	"minidb/index"
 	"minidb/storage"
+	"minidb/table"
 )
 
 // ---------------------------------------------------------------------------
@@ -153,4 +159,101 @@ func (r Row) Encode(s Schema) (storage.Record, error) {
 		}
 	}
 	return storage.EncodeFields(fields)
+}
+
+// DecodeRow is the inverse of Row.Encode.
+func DecodeRow(s Schema, rec storage.Record) (Row, error) {
+	fields, err := storage.DecodeFields(rec)
+	if err != nil {
+		return nil, err
+	}
+	if len(fields) != len(s.Columns) {
+		return nil, fmt.Errorf("db: record has %d fields, schema has %d columns", len(fields), len(s.Columns))
+	}
+	row := make(Row, len(fields))
+	for i, f := range fields {
+		col := s.Columns[i]
+		if len(f) == 0 {
+			row[i] = NullValue(col.Type)
+			continue
+		}
+		switch col.Type {
+		case TypeInt:
+			row[i] = IntValue(DecodeInt(f))
+		default:
+			row[i] = TextValue(string(f[1:]))
+		}
+	}
+	return row, nil
+}
+
+// EncodeInt produces an order-preserving 8 byte key for an int64: big-endian
+// with the sign bit flipped, so bytes.Compare agrees with integer comparison.
+func EncodeInt(v int64) []byte {
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(v)^(1<<63))
+	return b[:]
+}
+
+// DecodeInt reverses EncodeInt.
+func DecodeInt(b []byte) int64 {
+	if len(b) < 8 {
+		return 0
+	}
+	return int64(binary.BigEndian.Uint64(b) ^ (1 << 63))
+}
+
+// IndexKey encodes a value as an index key.
+func IndexKey(v Value) []byte {
+	if v.Null {
+		return []byte{0} // nulls sort first and share one key
+	}
+	if v.Type == TypeInt {
+		return append([]byte{1}, EncodeInt(v.Int)...)
+	}
+	return append([]byte{1}, v.Text...)
+}
+
+// MinKeyFor / MaxKeyFor bound a range scan over a column type.
+func MinKeyFor(t Type) []byte {
+	if t == TypeInt {
+		return append([]byte{1}, EncodeInt(math.MinInt64)...)
+	}
+	return []byte{1}
+}
+
+// IndexDef describes a secondary index.
+type IndexDef struct {
+	Name   string         `json:"name"`
+	Column string         `json:"column"`
+	Meta   storage.PageID `json:"meta"`
+	Unique bool           `json:"unique"`
+}
+
+// TableDef is a table's persistent definition.
+type TableDef struct {
+	ID       uint32         `json:"id"`
+	Name     string         `json:"name"`
+	Schema   Schema         `json:"schema"`
+	HeapMeta storage.PageID `json:"heap_meta"`
+	Indexes  []IndexDef     `json:"indexes"`
+}
+
+// Errors from the catalog.
+var (
+	ErrTableExists   = errors.New("db: table already exists")
+	ErrNoSuchTable   = errors.New("db: no such table")
+	ErrNoSuchColumn  = errors.New("db: no such column")
+	ErrIndexExists   = errors.New("db: index already exists")
+	ErrNoSuchIndex   = errors.New("db: no such index")
+	ErrSchemaMismatc = errors.New("db: value does not match the column type")
+)
+
+// Catalog holds every table definition, in memory and on disk.
+type Catalog struct {
+	mu     sync.RWMutex
+	heap   *table.Heap
+	tables map[string]*Table
+	nextID uint32
+	rids   map[string]storage.RID // catalog record per table, for updates
 }
