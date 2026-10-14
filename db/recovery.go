@@ -6,6 +6,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"minidb/index"
 	"minidb/pageops"
 	"minidb/storage"
 	"minidb/txn"
@@ -294,4 +296,131 @@ func (d *DB) redo(from wal.LSN) (int, error) {
 		return nil
 	})
 	return redone, err
+}
+
+// undo rolls back every loser, always undoing the highest LSN still
+// outstanding. Processing the losers together in LSN order (rather than one
+// transaction at a time) means each log record is read exactly once.
+func (d *DB) undo(losers map[uint64]wal.LSN) (int, error) {
+	cursors := map[uint64]*recTxn{}
+	for id, last := range losers {
+		cursors[id] = &recTxn{id: id, last: last}
+	}
+	undone := 0
+	trees := d.cat.indexTrees()
+
+	for {
+		// Pick the transaction whose next record to undo is the newest.
+		var pick *recTxn
+		for _, c := range cursors {
+			if c.LastLSN() == wal.InvalidLSN {
+				continue
+			}
+			if pick == nil || c.LastLSN() > pick.LastLSN() {
+				pick = c
+			}
+		}
+		if pick == nil {
+			break
+		}
+		lsn := pick.LastLSN()
+		rec, err := d.log.Read(lsn)
+		if err != nil {
+			return undone, err
+		}
+		next, did, err := d.undoOne(pick, rec, trees)
+		if err != nil {
+			return undone, err
+		}
+		if did {
+			undone++
+		}
+		if next == wal.InvalidLSN {
+			// Reached the BEGIN: the transaction is fully rolled back.
+			d.log.Append(&wal.Record{TxnID: pick.id, Type: wal.TypeAbort, PrevLSN: pick.LastLSN()})
+			endLSN, _ := d.log.Append(&wal.Record{TxnID: pick.id, Type: wal.TypeEnd, PrevLSN: pick.LastLSN()})
+			_ = endLSN
+			delete(cursors, pick.id)
+			continue
+		}
+		pick.setNext(next)
+	}
+	return undone, nil
+}
+
+// setNext moves the undo cursor without disturbing the LSN chain that CLRs
+// have already established.
+func (r *recTxn) setNext(l wal.LSN) {
+	r.mu.Lock()
+	r.last = l
+	r.mu.Unlock()
+}
+
+// undoOne reverses a single log record and reports where the rollback
+// continues.
+func (d *DB) undoOne(t pageops.TxnState, rec *wal.Record, trees map[storage.PageID]*index.Tree) (wal.LSN, bool, error) {
+	ctx := pageops.Ctx{Pool: d.pool, Log: d.log, Txn: t}
+
+	switch rec.Type {
+	case wal.TypeBegin:
+		return wal.InvalidLSN, false, nil
+
+	case wal.TypeCLR:
+		// Already compensated: skip straight past the record it undid.
+		return rec.UndoNext, false, nil
+
+	case wal.TypeIdxInsert, wal.TypeIdxDelete:
+		// Logical undo: re-run the inverse operation against the tree, because
+		// the entry may have moved pages since it was written.
+		tree := trees[rec.PageID]
+		if tree == nil {
+			// The index is gone (dropped table): nothing to undo.
+			return rec.PrevLSN, false, nil
+		}
+		key := rec.Before
+		rid := storage.DecodeRID(rec.After)
+		var err error
+		inverse := wal.TypeIdxDelete
+		if rec.Type == wal.TypeIdxInsert {
+			err = tree.UndoInsert(ctx, key, rid)
+		} else {
+			inverse = wal.TypeIdxInsert
+			err = tree.UndoDelete(ctx, key, rid)
+		}
+		if err != nil {
+			return wal.InvalidLSN, false, err
+		}
+		// The compensation record goes in after the logical undo has
+		// finished. If we crash in between, the undo simply runs again - it is
+		// idempotent (deleting an absent entry, or re-inserting an existing
+		// one, are both no-ops).
+		if _, err := ctx.LogTxnRecord(&wal.Record{
+			Type:     wal.TypeCLR,
+			Op:       uint8(inverse),
+			UndoNext: rec.PrevLSN,
+			PageID:   rec.PageID,
+			Before:   key,
+			After:    rec.After,
+			Flags:    wal.FlagRedoOnly,
+		}); err != nil {
+			return wal.InvalidLSN, false, err
+		}
+		return rec.PrevLSN, true, nil
+
+	case wal.TypeInsert, wal.TypeUpdate, wal.TypeDelete, wal.TypePageHeader:
+		if rec.RedoOnly() {
+			return rec.PrevLSN, false, nil // structural: replayed, never reversed
+		}
+		h, err := d.pool.FetchWrite(rec.PageID)
+		if err != nil {
+			return wal.InvalidLSN, false, err
+		}
+		defer h.Release()
+		if err := ctx.ApplyCLR(h, rec, rec.PrevLSN); err != nil {
+			return wal.InvalidLSN, false, err
+		}
+		return rec.PrevLSN, true, nil
+	}
+	// Commit/abort/end/alloc/checkpoint records carry nothing to undo.
+	return rec.PrevLSN, false, nil
 }
