@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"minidb/buffer"
+	"minidb/pageops"
 	"minidb/storage"
 	"minidb/txn"
 	"minidb/wal"
@@ -147,4 +148,79 @@ func Open(dir string, opts Options) (*DB, error) {
 		}
 	}
 	return d, nil
+}
+
+// Dir is the database directory.
+func (d *DB) Dir() string { return d.dir }
+
+// Pool exposes the buffer pool (stats, tests).
+func (d *DB) Pool() *buffer.Pool { return d.pool }
+
+// Log exposes the write-ahead log.
+func (d *DB) Log() *wal.Manager { return d.log }
+
+// Disk exposes the disk manager.
+func (d *DB) Disk() *storage.DiskManager { return d.dm }
+
+// Txns exposes the transaction manager.
+func (d *DB) Txns() *txn.Manager { return d.txns }
+
+// Catalog exposes the catalog.
+func (d *DB) Catalog() *Catalog { return d.cat }
+
+// Report returns what the last recovery did.
+func (d *DB) Report() RecoveryReport { return d.report }
+
+// ctx builds a logging context for a transaction.
+func (d *DB) ctx(t *txn.Txn) pageops.Ctx {
+	c := pageops.Ctx{Pool: d.pool, Log: d.log}
+	if t != nil {
+		c.Txn = t
+	}
+	return c
+}
+
+// Begin starts a transaction.
+func (d *DB) Begin() (*txn.Txn, error) { return d.txns.Begin() }
+
+// Commit commits a transaction, making it durable.
+func (d *DB) Commit(t *txn.Txn) error { return d.txns.Commit(t) }
+
+// Abort rolls a transaction back.
+func (d *DB) Abort(t *txn.Txn) error { return d.txns.Abort(t) }
+
+// Update runs fn inside a transaction, committing on success and rolling back
+// on error or panic.
+func (d *DB) Update(fn func(t *txn.Txn) error) error {
+	t, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = d.Abort(t)
+		}
+	}()
+	if err := fn(t); err != nil {
+		return err
+	}
+	if err := d.Commit(t); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+// View runs fn inside a read-only transaction.
+func (d *DB) View(fn func(t *txn.Txn) error) error {
+	t, err := d.txns.BeginReadOnly()
+	if err != nil {
+		return err
+	}
+	if err := fn(t); err != nil {
+		_ = d.Abort(t)
+		return err
+	}
+	return d.Commit(t)
 }
