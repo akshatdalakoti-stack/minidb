@@ -424,3 +424,26 @@ func (d *DB) undoOne(t pageops.TxnState, rec *wal.Record, trees map[storage.Page
 	// Commit/abort/end/alloc/checkpoint records carry nothing to undo.
 	return rec.PrevLSN, false, nil
 }
+
+// Rollback implements txn.Undoer: it is what Abort calls, and it is the same
+// walk that recovery's undo pass performs, just for a transaction that is
+// still in memory.
+func (d *DB) Rollback(t *txn.Txn) error {
+	trees := d.cat.indexTrees()
+	lsn := t.LastLSN()
+	for lsn != wal.InvalidLSN {
+		rec, err := d.log.Read(lsn)
+		if err != nil {
+			return err
+		}
+		next, _, err := d.undoOne(t, rec, trees)
+		if err != nil {
+			return err
+		}
+		if next == wal.InvalidLSN {
+			return nil
+		}
+		lsn = next
+	}
+	return nil
+}
