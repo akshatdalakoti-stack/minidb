@@ -747,3 +747,180 @@ func TestConcurrentTransactions(t *testing.T) {
 	}
 	t.Log(d.Stats())
 }
+
+func TestConcurrentReadersAndWriters(t *testing.T) {
+	d := openTestDB(t, t.TempDir())
+	defer d.Close()
+	tb, _ := d.CreateTable("users", usersSchema())
+
+	var rids []storage.RID
+	d.Update(func(tx *txn.Txn) error {
+		for i := 0; i < 200; i++ {
+			rid, err := d.Insert(tx, tb, userRow(i))
+			if err != nil {
+				return err
+			}
+			rids = append(rids, rid)
+		}
+		return nil
+	})
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	conflicts := 0
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 40; i++ {
+				rid := rids[(g*13+i)%len(rids)]
+				err := d.Update(func(tx *txn.Txn) error {
+					row, err := d.Get(tx, tb, rid)
+					if err != nil {
+						return err
+					}
+					row[2] = IntValue(row[2].Int + 1)
+					_, err = d.UpdateRow(tx, tb, rid, row)
+					return err
+				})
+				if err != nil {
+					// Deadlock or timeout: a legal outcome under 2PL, as long
+					// as the transaction was rolled back cleanly.
+					mu.Lock()
+					conflicts++
+					mu.Unlock()
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	t.Logf("%d transactions had to be retried (deadlock/timeout)", conflicts)
+
+	// Whatever happened, the database must still be consistent and readable.
+	n, err := d.Count(tb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 200 {
+		t.Fatalf("row count changed to %d", n)
+	}
+	if err := d.View(func(tx *txn.Txn) error {
+		return d.Scan(tx, tb, func(r ScanRow) error {
+			if r.Row[2].Int < 20 {
+				return fmt.Errorf("row %v has a nonsensical age", r.Row)
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestHundredGoroutines is the concurrency exercise from the brief: 100
+// goroutines inserting, reading and updating at the same time, followed by a
+// consistency check of the whole database.
+func TestHundredGoroutines(t *testing.T) {
+	d := openTestDB(t, t.TempDir())
+	defer d.Close()
+	tb, _ := d.CreateTable("users", usersSchema())
+	tb, _ = d.CreateIndex("users", "users_by_id", "id", false)
+
+	// A committed baseline for the readers and updaters to work on.
+	var baseRIDs []storage.RID
+	if err := d.Update(func(tx *txn.Txn) error {
+		for i := 0; i < 500; i++ {
+			rid, err := d.Insert(tx, tb, userRow(i))
+			if err != nil {
+				return err
+			}
+			baseRIDs = append(baseRIDs, rid)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	const goroutines = 100
+	var wg sync.WaitGroup
+	var inserted, reads, updates, conflicts int64
+	var mu sync.Mutex
+	bump := func(p *int64) { mu.Lock(); *p++; mu.Unlock() }
+
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 20; i++ {
+				switch g % 3 {
+				case 0: // writers
+					id := 10000 + g*100 + i
+					if err := d.Update(func(tx *txn.Txn) error {
+						_, err := d.Insert(tx, tb, userRow(id))
+						return err
+					}); err != nil {
+						bump(&conflicts)
+					} else {
+						bump(&inserted)
+					}
+				case 1: // readers
+					if err := d.View(func(tx *txn.Txn) error {
+						_, err := d.IndexLookup(tx, tb, "id", IntValue(int64((g*7+i)%500)))
+						return err
+					}); err != nil {
+						bump(&conflicts)
+					} else {
+						bump(&reads)
+					}
+				default: // updaters
+					rid := baseRIDs[(g*13+i)%len(baseRIDs)]
+					if err := d.Update(func(tx *txn.Txn) error {
+						row, err := d.Get(tx, tb, rid)
+						if err != nil {
+							return err
+						}
+						row[2] = IntValue(row[2].Int + 1)
+						_, err = d.UpdateRow(tx, tb, rid, row)
+						return err
+					}); err != nil {
+						bump(&conflicts)
+					} else {
+						bump(&updates)
+					}
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	t.Logf("%d inserts, %d reads, %d updates, %d conflicts", inserted, reads, updates, conflicts)
+
+	// Consistency: the heap holds exactly the rows that committed, and every
+	// one of them is reachable through the index.
+	n, err := d.Count(tb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int64(n) != 500+inserted {
+		t.Fatalf("heap holds %d rows, expected %d", n, 500+inserted)
+	}
+	if err := d.View(func(tx *txn.Txn) error {
+		return d.Scan(tx, tb, func(r ScanRow) error {
+			rows, err := d.IndexLookup(tx, tb, "id", r.Row[0])
+			if err != nil {
+				return err
+			}
+			for _, got := range rows {
+				if got.RID == r.RID {
+					return nil
+				}
+			}
+			return fmt.Errorf("row %v (id %v) is missing from the index", r.RID, r.Row[0])
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if s := d.Pool().Stats(); s.Pinned != 0 {
+		t.Fatalf("pins leaked: %v", s)
+	}
+}
+
+// --- the "definition of done" walkthrough ---------------------------------
