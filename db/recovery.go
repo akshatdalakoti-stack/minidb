@@ -199,3 +199,99 @@ func (d *DB) recover() error {
 	d.report.Duration = time.Since(start)
 	return nil
 }
+
+// analysis reads forward from the checkpoint and reconstructs the transaction
+// table.
+func (d *DB) analysis(from wal.LSN) (map[uint64]*txnInfo, uint64, storage.PageID, int, error) {
+	att := map[uint64]*txnInfo{}
+	var maxTxn uint64
+	maxPage := storage.InvalidPageID
+	scanned := 0
+
+	err := d.log.Scan(from, func(r *wal.Record) error {
+		scanned++
+		if r.TxnID > maxTxn {
+			maxTxn = r.TxnID
+		}
+		if r.PageID != storage.InvalidPageID && r.PageID != 0 &&
+			(maxPage == storage.InvalidPageID || r.PageID > maxPage) &&
+			isPageRecord(r) {
+			maxPage = r.PageID
+		}
+		if r.Type == wal.TypeCheckpointEnd {
+			// Seed the table with the transactions that were running when the
+			// checkpoint was taken; their BEGIN records are behind us.
+			seed, err := decodeATT(r.After)
+			if err != nil {
+				return err
+			}
+			for id, lsn := range seed {
+				if _, ok := att[id]; !ok {
+					att[id] = &txnInfo{lastLSN: lsn}
+				}
+				if id > maxTxn {
+					maxTxn = id
+				}
+			}
+			return nil
+		}
+		if r.TxnID == 0 {
+			return nil // system record, belongs to no transaction
+		}
+		info := att[r.TxnID]
+		if info == nil {
+			info = &txnInfo{}
+			att[r.TxnID] = info
+		}
+		info.lastLSN = r.LSN
+		switch r.Type {
+		case wal.TypeCommit:
+			info.committed = true
+		case wal.TypeEnd:
+			info.ended = true
+		}
+		return nil
+	})
+	return att, maxTxn, maxPage, scanned, err
+}
+
+// isPageRecord reports whether a record describes a change to a specific page.
+func isPageRecord(r *wal.Record) bool {
+	switch r.Type {
+	case wal.TypeInsert, wal.TypeUpdate, wal.TypeDelete, wal.TypePageInit, wal.TypePageHeader:
+		return true
+	case wal.TypeCLR:
+		return wal.Type(r.Op) != wal.TypeIdxInsert && wal.Type(r.Op) != wal.TypeIdxDelete
+	}
+	return false
+}
+
+// redo repeats history from the given LSN.
+//
+// The page LSN is what makes this safe to run over and over: a page that
+// already reflects a record is left alone, so recovery is idempotent and a
+// crash during recovery costs nothing but time.
+func (d *DB) redo(from wal.LSN) (int, error) {
+	redone := 0
+	err := d.log.Scan(from, func(r *wal.Record) error {
+		if !isPageRecord(r) {
+			return nil
+		}
+		h, err := d.pool.FetchWrite(r.PageID)
+		if err != nil {
+			return fmt.Errorf("fetching page %v for redo of %v: %w", r.PageID, r, err)
+		}
+		defer h.Release()
+		if h.Page().LSN() >= r.LSN {
+			return nil // the change is already on the page
+		}
+		h.MarkDirty()
+		if err := wal.Redo(h.Page(), r); err != nil {
+			return fmt.Errorf("redo %v: %w", r, err)
+		}
+		h.Page().SetLSN(r.LSN)
+		redone++
+		return nil
+	})
+	return redone, err
+}
