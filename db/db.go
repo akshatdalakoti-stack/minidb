@@ -224,3 +224,97 @@ func (d *DB) View(fn func(t *txn.Txn) error) error {
 	}
 	return d.Commit(t)
 }
+
+// CreateTable creates a table in its own transaction.
+func (d *DB) CreateTable(name string, schema Schema) (*Table, error) {
+	var out *Table
+	err := d.Update(func(t *txn.Txn) error {
+		if err := d.txns.Locks().Acquire(t, txn.TableKey(0), txn.LockExclusive); err != nil {
+			return err
+		}
+		tb, err := d.cat.createTable(d.ctx(t), name, schema)
+		if err != nil {
+			return err
+		}
+		out = tb
+		return nil
+	})
+	return out, err
+}
+
+// CreateIndex builds a secondary index on a column and back-fills it.
+func (d *DB) CreateIndex(tableName, idxName, column string, unique bool) (*Table, error) {
+	var out *Table
+	err := d.Update(func(t *txn.Txn) error {
+		tb, err := d.cat.Get(tableName)
+		if err != nil {
+			return err
+		}
+		if err := d.txns.Locks().Acquire(t, txn.TableKey(tb.Def.ID), txn.LockExclusive); err != nil {
+			return err
+		}
+		out, err = d.cat.createIndex(d.ctx(t), tableName, idxName, column, unique)
+		return err
+	})
+	return out, err
+}
+
+// DropTable removes a table.
+func (d *DB) DropTable(name string) error {
+	return d.Update(func(t *txn.Txn) error {
+		tb, err := d.cat.Get(name)
+		if err != nil {
+			return err
+		}
+		if err := d.txns.Locks().Acquire(t, txn.TableKey(tb.Def.ID), txn.LockExclusive); err != nil {
+			return err
+		}
+		return d.cat.dropTable(d.ctx(t), name)
+	})
+}
+
+// Table returns a table by name.
+func (d *DB) Table(name string) (*Table, error) { return d.cat.Get(name) }
+
+// Checkpoint makes the database state on disk match the log, so that the next
+// recovery has less work to do.
+//
+// This is a "sharp" checkpoint: it writes a begin marker, flushes every dirty
+// page, then records the still-running transactions. Recovery can then start
+// its analysis at the begin marker, because every page change logged before it
+// is already in the data file. A fuzzy checkpoint (which does not flush, and
+// instead records the dirty page table) would block writers even less; this
+// one is simpler to reason about and still bounds recovery time.
+func (d *DB) Checkpoint() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return os.ErrClosed
+	}
+	begin, err := d.log.Append(&wal.Record{Type: wal.TypeCheckpointBegin})
+	if err != nil {
+		return err
+	}
+	if err := d.pool.FlushAllPages(); err != nil {
+		return err
+	}
+	active := d.txns.Active()
+	payload, err := encodeATT(active)
+	if err != nil {
+		return err
+	}
+	if _, err := d.log.Append(&wal.Record{Type: wal.TypeCheckpointEnd, After: payload}); err != nil {
+		return err
+	}
+	if err := d.log.Flush(0); err != nil {
+		return err
+	}
+	if err := d.dm.SetNextTxnID(d.txns.NextID()); err != nil {
+		return err
+	}
+	// Only now is it safe to say "recovery may start here".
+	if err := d.dm.SetCheckpointLSN(begin); err != nil {
+		return err
+	}
+	return d.dm.Sync()
+}
