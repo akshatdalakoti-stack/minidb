@@ -239,3 +239,154 @@ func TestIndexLookupAndRange(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestAbortRollsBackEverything(t *testing.T) {
+	d := openTestDB(t, t.TempDir())
+	defer d.Close()
+	tb, _ := d.CreateTable("users", usersSchema())
+	tb, _ = d.CreateIndex("users", "users_by_id", "id", false)
+
+	// A committed baseline.
+	if err := d.Update(func(tx *txn.Txn) error {
+		for i := 0; i < 50; i++ {
+			if _, err := d.Insert(tx, tb, userRow(i)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := d.Count(tb)
+
+	// Now a transaction that does a lot and then changes its mind.
+	tx, err := d.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doomed []storage.RID
+	for i := 100; i < 300; i++ {
+		rid, err := d.Insert(tx, tb, userRow(i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		doomed = append(doomed, rid)
+	}
+	if err := d.Abort(tx); err != nil {
+		t.Fatal(err)
+	}
+
+	after, _ := d.Count(tb)
+	if after != before {
+		t.Fatalf("rollback left %d rows behind (%d -> %d)", after-before, before, after)
+	}
+	if err := d.View(func(tx *txn.Txn) error {
+		for _, rid := range doomed {
+			if _, err := d.Get(tx, tb, rid); err == nil {
+				return fmt.Errorf("aborted row %v is still readable", rid)
+			}
+		}
+		// The index must have been rolled back too, not just the heap.
+		rows, err := d.IndexLookup(tx, tb, "id", IntValue(150))
+		if err != nil {
+			return err
+		}
+		if len(rows) != 0 {
+			return fmt.Errorf("aborted row still in the index: %v", rows)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAbortOfUpdateAndDelete(t *testing.T) {
+	d := openTestDB(t, t.TempDir())
+	defer d.Close()
+	tb, _ := d.CreateTable("users", usersSchema())
+
+	var rids []storage.RID
+	if err := d.Update(func(tx *txn.Txn) error {
+		for i := 0; i < 10; i++ {
+			rid, err := d.Insert(tx, tb, userRow(i))
+			if err != nil {
+				return err
+			}
+			rids = append(rids, rid)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, _ := d.Begin()
+	row := userRow(0)
+	row[1] = TextValue("changed-my-mind")
+	if _, err := d.UpdateRow(tx, tb, rids[0], row); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.DeleteRow(tx, tb, rids[1]); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Abort(tx); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := d.View(func(tx *txn.Txn) error {
+		r0, err := d.Get(tx, tb, rids[0])
+		if err != nil {
+			return err
+		}
+		if r0[1].Text != "user-0000" {
+			return fmt.Errorf("update not rolled back: %v", r0[1])
+		}
+		r1, err := d.Get(tx, tb, rids[1])
+		if err != nil {
+			return fmt.Errorf("deleted row not restored: %w", err)
+		}
+		if r1[0].Int != 1 {
+			return fmt.Errorf("restored row is wrong: %v", r1)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIsolationUncommittedRowsAreNotVisible(t *testing.T) {
+	d := openTestDB(t, t.TempDir())
+	defer d.Close()
+	tb, _ := d.CreateTable("users", usersSchema())
+
+	writer, _ := d.Begin()
+	rid, err := d.Insert(writer, tb, userRow(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A reader that tries to read the uncommitted row must block on the X lock
+	// rather than see it.
+	done := make(chan error, 1)
+	go func() {
+		reader, _ := d.Begin()
+		_, err := d.Get(reader, tb, rid)
+		d.Abort(reader)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("reader saw an uncommitted row (err=%v)", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := d.Commit(writer); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("reader failed after the writer committed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("reader never woke up")
+	}
+}
