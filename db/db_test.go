@@ -390,3 +390,170 @@ func TestIsolationUncommittedRowsAreNotVisible(t *testing.T) {
 		t.Fatal("reader never woke up")
 	}
 }
+
+func TestPersistenceAcrossCleanRestart(t *testing.T) {
+	dir := t.TempDir()
+	d := openTestDB(t, dir)
+	tb, _ := d.CreateTable("users", usersSchema())
+	d.CreateIndex("users", "users_by_id", "id", false)
+	tb, _ = d.Table("users")
+	if err := d.Update(func(tx *txn.Txn) error {
+		for i := 0; i < 500; i++ {
+			if _, err := d.Insert(tx, tb, userRow(i)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	d2 := openTestDB(t, dir)
+	defer d2.Close()
+	tb2, err := d2.Table("users")
+	if err != nil {
+		t.Fatalf("table definition did not survive: %v", err)
+	}
+	if tb2.Def.Schema.String() != usersSchema().String() {
+		t.Fatalf("schema changed: %v", tb2.Def.Schema)
+	}
+	n, _ := d2.Count(tb2)
+	if n != 500 {
+		t.Fatalf("%d rows after restart, want 500", n)
+	}
+	if err := d2.View(func(tx *txn.Txn) error {
+		rows, err := d2.IndexLookup(tx, tb2, "id", IntValue(499))
+		if err != nil {
+			return err
+		}
+		if len(rows) != 1 {
+			return fmt.Errorf("index did not survive restart: %v", rows)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// --- Phase 8: crash recovery ----------------------------------------------
+
+func TestRecoveryRedoesCommittedWork(t *testing.T) {
+	dir := t.TempDir()
+	d := openTestDB(t, dir)
+	tb, _ := d.CreateTable("users", usersSchema())
+	tb, _ = d.CreateIndex("users", "users_by_id", "id", false)
+
+	if err := d.Update(func(tx *txn.Txn) error {
+		for i := 0; i < 300; i++ {
+			if _, err := d.Insert(tx, tb, userRow(i)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The commit is durable in the log, but the pages are still dirty in RAM.
+	// Pull the plug.
+	d.SimulateCrash()
+
+	d2 := openTestDB(t, dir)
+	defer d2.Close()
+	rep := d2.Report()
+	t.Log(rep)
+	if rep.RecordsRedone == 0 {
+		t.Fatal("recovery redid nothing, so the crash test proved nothing")
+	}
+	tb2, err := d2.Table("users")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, _ := d2.Count(tb2)
+	if n != 300 {
+		t.Fatalf("%d rows after recovery, want 300", n)
+	}
+	if err := d2.View(func(tx *txn.Txn) error {
+		for _, i := range []int64{0, 42, 299} {
+			rows, err := d2.IndexLookup(tx, tb2, "id", IntValue(i))
+			if err != nil {
+				return err
+			}
+			if len(rows) != 1 {
+				return fmt.Errorf("id %d: index has %d entries after recovery", i, len(rows))
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecoveryUndoesUncommittedWork(t *testing.T) {
+	dir := t.TempDir()
+	d := openTestDB(t, dir)
+	tb, _ := d.CreateTable("users", usersSchema())
+	tb, _ = d.CreateIndex("users", "users_by_id", "id", false)
+
+	// Committed work.
+	if err := d.Update(func(tx *txn.Txn) error {
+		for i := 0; i < 100; i++ {
+			if _, err := d.Insert(tx, tb, userRow(i)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Uncommitted work from a transaction that will never finish.
+	loser, _ := d.Begin()
+	for i := 1000; i < 1200; i++ {
+		if _, err := d.Insert(loser, tb, userRow(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Force its pages to disk, so recovery genuinely has to undo them rather
+	// than just "not redo" them.
+	if err := d.Pool().FlushAllPages(); err != nil {
+		t.Fatal(err)
+	}
+	d.SimulateCrash()
+
+	d2 := openTestDB(t, dir)
+	defer d2.Close()
+	rep := d2.Report()
+	t.Log(rep)
+	if len(rep.Losers) != 1 || rep.Losers[0] != loser.ID() {
+		t.Fatalf("expected txn %d to be the loser, report says %v", loser.ID(), rep.Losers)
+	}
+	if rep.RecordsUndone == 0 {
+		t.Fatal("recovery undid nothing")
+	}
+	tb2, _ := d2.Table("users")
+	n, _ := d2.Count(tb2)
+	if n != 100 {
+		t.Fatalf("%d rows after recovery, want 100 (the uncommitted 200 must be gone)", n)
+	}
+	if err := d2.View(func(tx *txn.Txn) error {
+		rows, err := d2.IndexLookup(tx, tb2, "id", IntValue(1100))
+		if err != nil {
+			return err
+		}
+		if len(rows) != 0 {
+			return fmt.Errorf("uncommitted row survived in the index: %v", rows)
+		}
+		rows, err = d2.IndexLookup(tx, tb2, "id", IntValue(50))
+		if err != nil {
+			return err
+		}
+		if len(rows) != 1 {
+			return fmt.Errorf("committed row lost: %v", rows)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
