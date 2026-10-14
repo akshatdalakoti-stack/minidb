@@ -19,6 +19,7 @@
 package db
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -318,3 +319,82 @@ func (d *DB) Checkpoint() error {
 	}
 	return d.dm.Sync()
 }
+
+// Close rolls back anything still running, checkpoints and closes the files.
+func (d *DB) Close() error {
+	d.mu.Lock()
+	if d.closed {
+		d.mu.Unlock()
+		return nil
+	}
+	d.mu.Unlock()
+
+	if d.txns != nil {
+		d.txns.AbortAll()
+	}
+	var firstErr error
+	if !d.opts.ReadOnly {
+		if err := d.Checkpoint(); err != nil {
+			firstErr = err
+		}
+	}
+	d.mu.Lock()
+	d.closed = true
+	d.mu.Unlock()
+
+	if err := d.log.Close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := d.dm.Close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
+}
+
+// SimulateCrash abandons the database the way a power cut would: the buffer
+// pool's dirty pages are dropped on the floor, the unflushed tail of the log
+// goes with them, and no checkpoint is written. What survives is exactly what
+// the durability rules promised would survive - which is what makes this a
+// meaningful test of recovery rather than a test of Close.
+func (d *DB) SimulateCrash() {
+	d.mu.Lock()
+	d.closed = true
+	d.mu.Unlock()
+	_ = d.log.CloseNoFlush()
+	_ = d.dm.CloseNoSync()
+}
+
+// Stats is a snapshot of the whole engine.
+type Stats struct {
+	Buffer  buffer.PoolStats
+	Disk    storage.Stats
+	Log     wal.Stats
+	Commits int64
+	Aborts  int64
+	Deadlks int
+	Tables  int
+}
+
+func (s Stats) String() string {
+	return fmt.Sprintf("tables=%d commits=%d aborts=%d deadlocks=%d\n  buffer: %v\n  disk:   reads=%d writes=%d allocs=%d syncs=%d\n  wal:    appends=%d syncs=%d bytes=%d",
+		s.Tables, s.Commits, s.Aborts, s.Deadlks, s.Buffer,
+		s.Disk.Reads, s.Disk.Writes, s.Disk.Allocs, s.Disk.Syncs,
+		s.Log.Appends, s.Log.Syncs, s.Log.BytesWritten)
+}
+
+// Stats returns engine-wide counters.
+func (d *DB) Stats() Stats {
+	c, a, dl := d.txns.Stats()
+	return Stats{
+		Buffer:  d.pool.Stats(),
+		Disk:    d.dm.Stats(),
+		Log:     d.log.Stats(),
+		Commits: c,
+		Aborts:  a,
+		Deadlks: dl,
+		Tables:  len(d.cat.Tables()),
+	}
+}
+
+// ErrClosed is returned by operations on a closed database.
+var ErrClosed = errors.New("db: database is closed")
