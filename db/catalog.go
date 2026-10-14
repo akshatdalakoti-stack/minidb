@@ -2,6 +2,7 @@ package db
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -10,6 +11,7 @@ import (
 	"sync"
 
 	"minidb/index"
+	"minidb/pageops"
 	"minidb/storage"
 	"minidb/table"
 )
@@ -256,4 +258,122 @@ type Catalog struct {
 	tables map[string]*Table
 	nextID uint32
 	rids   map[string]storage.RID // catalog record per table, for updates
+}
+
+// Table is a table: its definition, its heap file and its indexes.
+type Table struct {
+	Def     TableDef
+	Heap    *table.Heap
+	Indexes []*index.Tree
+}
+
+// IndexOn returns the index on a column, if there is one.
+func (t *Table) IndexOn(col string) (*index.Tree, IndexDef, bool) {
+	for i, d := range t.Def.Indexes {
+		if strings.EqualFold(d.Column, col) {
+			return t.Indexes[i], d, true
+		}
+	}
+	return nil, IndexDef{}, false
+}
+
+// loadCatalog reads the catalog heap into memory, or creates it if this is a
+// brand new database.
+func loadCatalog(ctx pageops.Ctx, dm *storage.DiskManager) (*Catalog, error) {
+	c := &Catalog{tables: map[string]*Table{}, rids: map[string]storage.RID{}, nextID: 1}
+	root := dm.CatalogRoot()
+	if root == storage.InvalidPageID {
+		h, err := table.Create(ctx, "__catalog", 0)
+		if err != nil {
+			return nil, fmt.Errorf("db: creating catalog: %w", err)
+		}
+		c.heap = h
+		if err := dm.SetCatalogRoot(h.MetaPage()); err != nil {
+			return nil, err
+		}
+		return c, nil
+	}
+	h, err := table.Open(ctx.Pool, root, "__catalog", 0)
+	if err != nil {
+		return nil, fmt.Errorf("db: opening catalog: %w", err)
+	}
+	c.heap = h
+
+	s := h.Scan()
+	for s.Next() {
+		row := s.Row()
+		var def TableDef
+		if err := json.Unmarshal(row.Record, &def); err != nil {
+			return nil, fmt.Errorf("db: corrupt catalog entry %v: %w", row.RID, err)
+		}
+		t, err := openTable(ctx, def)
+		if err != nil {
+			return nil, err
+		}
+		c.tables[strings.ToLower(def.Name)] = t
+		c.rids[strings.ToLower(def.Name)] = row.RID
+		if def.ID >= c.nextID {
+			c.nextID = def.ID + 1
+		}
+	}
+	return c, s.Err()
+}
+
+func openTable(ctx pageops.Ctx, def TableDef) (*Table, error) {
+	hp, err := table.Open(ctx.Pool, def.HeapMeta, def.Name, def.ID)
+	if err != nil {
+		return nil, err
+	}
+	t := &Table{Def: def, Heap: hp}
+	for _, id := range def.Indexes {
+		t.Indexes = append(t.Indexes, index.Open(ctx.Pool, id.Meta, id.Name))
+	}
+	return t, nil
+}
+
+// Get returns a table by name.
+func (c *Catalog) Get(name string) (*Table, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	t, ok := c.tables[strings.ToLower(name)]
+	if !ok {
+		return nil, fmt.Errorf("%w: %q", ErrNoSuchTable, name)
+	}
+	return t, nil
+}
+
+// Tables lists the table names in the database.
+func (c *Catalog) Tables() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]string, 0, len(c.tables))
+	for _, t := range c.tables {
+		out = append(out, t.Def.Name)
+	}
+	return out
+}
+
+// createTable adds a table: a heap file plus a catalog record.
+func (c *Catalog) createTable(ctx pageops.Ctx, name string, schema Schema) (*Table, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := strings.ToLower(name)
+	if _, exists := c.tables[key]; exists {
+		return nil, fmt.Errorf("%w: %q", ErrTableExists, name)
+	}
+	id := c.nextID
+	hp, err := table.Create(ctx, name, id)
+	if err != nil {
+		return nil, err
+	}
+	def := TableDef{ID: id, Name: name, Schema: schema, HeapMeta: hp.MetaPage()}
+	rid, err := c.writeDef(ctx, def)
+	if err != nil {
+		return nil, err
+	}
+	c.nextID++
+	t := &Table{Def: def, Heap: hp}
+	c.tables[key] = t
+	c.rids[key] = rid
+	return t, nil
 }
