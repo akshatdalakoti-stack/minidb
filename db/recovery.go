@@ -3,9 +3,11 @@ package db
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 	"minidb/pageops"
+	"minidb/storage"
 	"minidb/txn"
 	"minidb/wal"
 )
@@ -102,4 +104,98 @@ func decodeATT(b []byte) (map[uint64]wal.LSN, error) {
 		out[id] = v
 	}
 	return out, nil
+}
+
+// txnInfo is what analysis learns about one transaction.
+type txnInfo struct {
+	lastLSN   wal.LSN
+	committed bool
+	ended     bool
+}
+
+// recover runs the three passes and then brings the catalog and transaction
+// manager online.
+func (d *DB) recover() error {
+	start := time.Now()
+	startLSN := d.dm.CheckpointLSN()
+	if startLSN == wal.InvalidLSN {
+		startLSN = 0 // start of the log
+	}
+
+	att, maxTxnID, maxPage, scanned, err := d.analysis(startLSN)
+	if err != nil {
+		return fmt.Errorf("analysis: %w", err)
+	}
+	d.report = RecoveryReport{
+		Ran:            true,
+		StartLSN:       startLSN,
+		EndLSN:         d.log.NextLSN(),
+		RecordsScanned: scanned,
+	}
+
+	// The log may mention pages that the data file lost (AllocatePage extends
+	// the file without an fsync). Stretch the file back out before redo.
+	if maxPage != storage.InvalidPageID {
+		if err := d.dm.EnsurePages(uint32(maxPage) + 1); err != nil {
+			return err
+		}
+	}
+
+	redone, err := d.redo(startLSN)
+	if err != nil {
+		return fmt.Errorf("redo: %w", err)
+	}
+	d.report.RecordsRedone = redone
+
+	// The transaction manager has to exist before undo, so that rolled back
+	// transactions get ids that cannot collide with the losers.
+	next := d.dm.NextTxnID()
+	if maxTxnID+1 > next {
+		next = maxTxnID + 1
+	}
+	d.txns = txn.NewManager(d.log, d.opts.LockTimeout, next)
+
+	// Now that every page is physically up to date, the catalog can be read -
+	// and undo needs it, because undoing an index change is a logical
+	// operation against the tree.
+	ctx := pageops.Ctx{Pool: d.pool, Log: d.log}
+	cat, err := loadCatalog(ctx, d.dm)
+	if err != nil {
+		return err
+	}
+	d.cat = cat
+
+	losers := map[uint64]wal.LSN{}
+	winners := 0
+	for id, info := range att {
+		switch {
+		case info.ended:
+			winners++
+		case info.committed:
+			// Committed but no END record: its effects are redone and it needs
+			// no undo. Write the END now so the next recovery skips it.
+			winners++
+			d.log.Append(&wal.Record{TxnID: id, Type: wal.TypeEnd, PrevLSN: info.lastLSN})
+		default:
+			losers[id] = info.lastLSN
+		}
+	}
+	d.report.Winners = winners
+	for id := range losers {
+		d.report.Losers = append(d.report.Losers, id)
+	}
+	sort.Slice(d.report.Losers, func(i, j int) bool { return d.report.Losers[i] < d.report.Losers[j] })
+
+	if !d.opts.ReadOnly && len(losers) > 0 {
+		undone, err := d.undo(losers)
+		if err != nil {
+			return fmt.Errorf("undo: %w", err)
+		}
+		d.report.RecordsUndone = undone
+	}
+	if err := d.log.Flush(0); err != nil {
+		return err
+	}
+	d.report.Duration = time.Since(start)
+	return nil
 }
