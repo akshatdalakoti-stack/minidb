@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"minidb/db"
+	"minidb/storage"
 	"minidb/txn"
 )
 
@@ -520,4 +521,120 @@ func (s *Session) insert(t *txn.Txn, st *Insert) (*Result, error) {
 		count++
 	}
 	return &Result{Affected: count, Message: fmt.Sprintf("inserted %d row(s)", count)}, nil
+}
+
+func coerce(col db.Column, v db.Value) (db.Value, error) {
+	if v.Null {
+		return db.NullValue(col.Type), nil
+	}
+	if v.Type != col.Type {
+		return db.Value{}, fmt.Errorf("column %q is %s, but the value %s is %s",
+			col.Name, col.Type, v, v.Type)
+	}
+	return v, nil
+}
+
+func (s *Session) update(t *txn.Txn, st *Update) (*Result, error) {
+	tb, err := s.d.Table(st.Table)
+	if err != nil {
+		return nil, err
+	}
+	rows, _, err := s.rowsFor(t, tb, st.Where)
+	if err != nil {
+		return nil, err
+	}
+	// Materialize the target list before touching anything: modifying rows
+	// while an index scan is open would let a row be visited twice, once under
+	// its old key and once under its new one (the "Halloween problem").
+	targets := make([]db.ScanRow, len(rows))
+	copy(targets, rows)
+
+	count := 0
+	for _, r := range targets {
+		row := append(db.Row(nil), r.Row...)
+		for _, set := range st.Sets {
+			j := tb.Def.Schema.ColumnIndex(set.Column)
+			if j < 0 {
+				return nil, fmt.Errorf("%w: %s.%s", db.ErrNoSuchColumn, st.Table, set.Column)
+			}
+			cv, err := coerce(tb.Def.Schema.Columns[j], set.Value)
+			if err != nil {
+				return nil, err
+			}
+			row[j] = cv
+		}
+		if _, err := s.d.UpdateRow(t, tb, r.RID, row); err != nil {
+			return nil, err
+		}
+		count++
+	}
+	return &Result{Affected: count, Message: fmt.Sprintf("updated %d row(s)", count)}, nil
+}
+
+func (s *Session) delete(t *txn.Txn, st *Delete) (*Result, error) {
+	tb, err := s.d.Table(st.Table)
+	if err != nil {
+		return nil, err
+	}
+	rows, _, err := s.rowsFor(t, tb, st.Where)
+	if err != nil {
+		return nil, err
+	}
+	rids := make([]storage.RID, len(rows))
+	for i, r := range rows {
+		rids[i] = r.RID
+	}
+	for _, rid := range rids {
+		if err := s.d.DeleteRow(t, tb, rid); err != nil {
+			return nil, err
+		}
+	}
+	return &Result{Affected: len(rids), Message: fmt.Sprintf("deleted %d row(s)", len(rids))}, nil
+}
+
+// --- formatting ------------------------------------------------------------
+
+// String renders a result as a text table.
+func (r *Result) String() string {
+	if len(r.Columns) == 0 {
+		return r.Message
+	}
+	widths := make([]int, len(r.Columns))
+	for i, c := range r.Columns {
+		widths[i] = len(c)
+	}
+	cells := make([][]string, len(r.Rows))
+	for i, row := range r.Rows {
+		cells[i] = make([]string, len(row))
+		for j, v := range row {
+			cells[i][j] = v.String()
+			if len(cells[i][j]) > widths[j] {
+				widths[j] = len(cells[i][j])
+			}
+		}
+	}
+	var sb strings.Builder
+	writeRow := func(vals []string) {
+		for i, v := range vals {
+			if i > 0 {
+				sb.WriteString(" | ")
+			}
+			sb.WriteString(v)
+			sb.WriteString(strings.Repeat(" ", widths[i]-len(v)))
+		}
+		sb.WriteString("\n")
+	}
+	writeRow(r.Columns)
+	for i := range r.Columns {
+		if i > 0 {
+			sb.WriteString("-+-")
+		}
+		sb.WriteString(strings.Repeat("-", widths[i]))
+	}
+	sb.WriteString("\n")
+	for _, c := range cells {
+		writeRow(c)
+	}
+	fmt.Fprintf(&sb, "(%d row(s))", len(r.Rows))
+	return sb.String()
 }
