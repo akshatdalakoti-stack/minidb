@@ -335,3 +335,124 @@ func (p *parser) statement() (Statement, error) {
 	}
 	return nil, fmt.Errorf("unrecognized statement starting at %s", p.peek())
 }
+
+func (p *parser) createStatement() (Statement, error) {
+	unique := p.accept("UNIQUE")
+	if p.accept("INDEX") {
+		name, err := p.ident("an index name")
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expect("ON"); err != nil {
+			return nil, err
+		}
+		tbl, err := p.ident("a table name")
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expect("("); err != nil {
+			return nil, err
+		}
+		col, err := p.ident("a column name")
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expect(")"); err != nil {
+			return nil, err
+		}
+		return &CreateIndex{Name: name, Table: tbl, Column: col, Unique: unique}, nil
+	}
+	if err := p.expect("TABLE"); err != nil {
+		return nil, err
+	}
+	name, err := p.ident("a table name")
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expect("("); err != nil {
+		return nil, err
+	}
+	var cols []db.Column
+	for {
+		cname, err := p.ident("a column name")
+		if err != nil {
+			return nil, err
+		}
+		ctype, err := p.ident("a column type")
+		if err != nil {
+			return nil, err
+		}
+		t, err := db.ParseType(ctype)
+		if err != nil {
+			return nil, err
+		}
+		cols = append(cols, db.Column{Name: cname, Type: t})
+		if p.accept(",") {
+			continue
+		}
+		break
+	}
+	if err := p.expect(")"); err != nil {
+		return nil, err
+	}
+	if len(cols) == 0 {
+		return nil, fmt.Errorf("a table needs at least one column")
+	}
+	return &CreateTable{Name: name, Columns: cols}, nil
+}
+
+func (p *parser) insertStatement() (Statement, error) {
+	if err := p.expect("INTO"); err != nil {
+		return nil, err
+	}
+	tbl, err := p.ident("a table name")
+	if err != nil {
+		return nil, err
+	}
+	st := &Insert{Table: tbl}
+	if p.accept("(") {
+		for {
+			col, err := p.ident("a column name")
+			if err != nil {
+				return nil, err
+			}
+			st.Columns = append(st.Columns, col)
+			if p.accept(",") {
+				continue
+			}
+			break
+		}
+		if err := p.expect(")"); err != nil {
+			return nil, err
+		}
+	}
+	if err := p.expect("VALUES"); err != nil {
+		return nil, err
+	}
+	for {
+		if err := p.expect("("); err != nil {
+			return nil, err
+		}
+		var row []db.Value
+		for {
+			v, err := p.value()
+			if err != nil {
+				return nil, err
+			}
+			row = append(row, v)
+			if p.accept(",") {
+				continue
+			}
+			break
+		}
+		if err := p.expect(")"); err != nil {
+			return nil, err
+		}
+		st.Rows = append(st.Rows, row)
+		if p.accept(",") {
+			continue
+		}
+		break
+	}
+	return st, nil
+}
