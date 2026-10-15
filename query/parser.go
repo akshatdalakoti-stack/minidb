@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+
+	"minidb/db"
 )
 
 // --- lexer -----------------------------------------------------------------
@@ -133,3 +135,89 @@ func tokenize(src string) ([]token, error) {
 }
 
 // --- AST -------------------------------------------------------------------
+
+// Statement is a parsed SQL statement.
+type Statement interface{ stmt() }
+
+// CreateTable is CREATE TABLE name (col type, ...).
+type CreateTable struct {
+	Name    string
+	Columns []db.Column
+}
+
+// CreateIndex is CREATE [UNIQUE] INDEX name ON table (column).
+type CreateIndex struct {
+	Name, Table, Column string
+	Unique              bool
+}
+
+// DropTable is DROP TABLE name.
+type DropTable struct{ Name string }
+
+// Insert is INSERT INTO table [(cols)] VALUES (...), (...).
+type Insert struct {
+	Table   string
+	Columns []string
+	Rows    [][]db.Value
+}
+
+// Condition is one comparison in a WHERE clause.
+type Condition struct {
+	Column string
+	Op     string
+	Value  db.Value
+}
+
+// Select is SELECT cols FROM table [WHERE ...] [ORDER BY col [DESC]] [LIMIT n].
+type Select struct {
+	Table   string
+	Columns []string // nil means *
+	Where   []Condition
+	OrderBy string
+	Desc    bool
+	Limit   int
+}
+
+// Assignment is one SET clause of an UPDATE.
+type Assignment struct {
+	Column string
+	Value  db.Value
+}
+
+// Update is UPDATE table SET ... [WHERE ...].
+type Update struct {
+	Table string
+	Sets  []Assignment
+	Where []Condition
+}
+
+// Delete is DELETE FROM table [WHERE ...].
+type Delete struct {
+	Table string
+	Where []Condition
+}
+
+// Transaction control.
+type Begin struct{}
+type Commit struct{}
+type Rollback struct{}
+
+// Introspection.
+type ShowTables struct{}
+type Describe struct{ Table string }
+type ShowStats struct{}
+type Checkpoint struct{}
+
+// Explain wraps a statement and reports the plan instead of running it.
+type Explain struct{ Stmt Statement }
+
+func (*CreateTable) stmt() {}
+func (*CreateIndex) stmt() {}
+func (*DropTable) stmt()   {}
+func (*Insert) stmt()      {}
+func (*Select) stmt()      {}
+func (*Update) stmt()      {}
+func (*Delete) stmt()      {}
+func (*Begin) stmt()       {}
+func (*Commit) stmt()      {}
+func (*Rollback) stmt()    {}
