@@ -410,3 +410,114 @@ func matches(tb *db.Table, row db.Row, where []Condition) (bool, error) {
 	}
 	return true, nil
 }
+
+func (s *Session) query(t *txn.Txn, st *Select) (*Result, error) {
+	tb, err := s.d.Table(st.Table)
+	if err != nil {
+		return nil, err
+	}
+	rows, p, err := s.rowsFor(t, tb, st.Where)
+	if err != nil {
+		return nil, err
+	}
+
+	// Projection.
+	cols := st.Columns
+	if cols == nil {
+		for _, c := range tb.Def.Schema.Columns {
+			cols = append(cols, c.Name)
+		}
+	}
+	idxs := make([]int, len(cols))
+	for i, name := range cols {
+		j := tb.Def.Schema.ColumnIndex(name)
+		if j < 0 {
+			return nil, fmt.Errorf("%w: %s.%s", db.ErrNoSuchColumn, st.Table, name)
+		}
+		idxs[i] = j
+	}
+
+	if st.OrderBy != "" {
+		j := tb.Def.Schema.ColumnIndex(st.OrderBy)
+		if j < 0 {
+			return nil, fmt.Errorf("%w: %s.%s", db.ErrNoSuchColumn, st.Table, st.OrderBy)
+		}
+		// An in-memory sort. A real engine would notice when the chosen index
+		// already produces this order and skip it.
+		sort.SliceStable(rows, func(a, b int) bool {
+			c := rows[a].Row[j].Compare(rows[b].Row[j])
+			if st.Desc {
+				return c > 0
+			}
+			return c < 0
+		})
+	}
+
+	out := make([][]db.Value, 0, len(rows))
+	for _, r := range rows {
+		if st.Limit >= 0 && len(out) >= st.Limit {
+			break
+		}
+		proj := make([]db.Value, len(idxs))
+		for i, j := range idxs {
+			proj[i] = r.Row[j]
+		}
+		out = append(out, proj)
+	}
+	return &Result{Columns: cols, Rows: out, Plan: p.String()}, nil
+}
+
+func (s *Session) insert(t *txn.Txn, st *Insert) (*Result, error) {
+	tb, err := s.d.Table(st.Table)
+	if err != nil {
+		return nil, err
+	}
+	schema := tb.Def.Schema
+
+	// Map the listed columns onto schema positions; unlisted columns are null.
+	positions := make([]int, 0, len(st.Columns))
+	for _, name := range st.Columns {
+		j := schema.ColumnIndex(name)
+		if j < 0 {
+			return nil, fmt.Errorf("%w: %s.%s", db.ErrNoSuchColumn, st.Table, name)
+		}
+		positions = append(positions, j)
+	}
+
+	count := 0
+	for _, vals := range st.Rows {
+		row := make(db.Row, len(schema.Columns))
+		for i := range row {
+			row[i] = db.NullValue(schema.Columns[i].Type)
+		}
+		if len(positions) == 0 {
+			if len(vals) != len(schema.Columns) {
+				return nil, fmt.Errorf("table %s has %d columns, but %d values were given",
+					st.Table, len(schema.Columns), len(vals))
+			}
+			for i, v := range vals {
+				cv, err := coerce(schema.Columns[i], v)
+				if err != nil {
+					return nil, err
+				}
+				row[i] = cv
+			}
+		} else {
+			if len(vals) != len(positions) {
+				return nil, fmt.Errorf("%d columns listed but %d values given", len(positions), len(vals))
+			}
+			for i, v := range vals {
+				cv, err := coerce(schema.Columns[positions[i]], v)
+				if err != nil {
+					return nil, err
+				}
+				row[positions[i]] = cv
+			}
+		}
+		if _, err := s.d.Insert(t, tb, row); err != nil {
+			return nil, err
+		}
+		count++
+	}
+	return &Result{Affected: count, Message: fmt.Sprintf("inserted %d row(s)", count)}, nil
+}
