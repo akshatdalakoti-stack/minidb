@@ -221,3 +221,117 @@ func (*Delete) stmt()      {}
 func (*Begin) stmt()       {}
 func (*Commit) stmt()      {}
 func (*Rollback) stmt()    {}
+func (*ShowTables) stmt()  {}
+func (*Describe) stmt()    {}
+func (*ShowStats) stmt()   {}
+func (*Checkpoint) stmt()  {}
+func (*Explain) stmt()     {}
+
+// --- parser ----------------------------------------------------------------
+
+type parser struct {
+	toks []token
+	pos  int
+}
+
+// Parse turns one SQL statement into an AST.
+func Parse(sql string) (Statement, error) {
+	toks, err := tokenize(sql)
+	if err != nil {
+		return nil, err
+	}
+	p := &parser{toks: toks}
+	st, err := p.statement()
+	if err != nil {
+		return nil, err
+	}
+	p.accept(";")
+	if p.peek().kind != tokEOF {
+		return nil, fmt.Errorf("unexpected %s after the end of the statement", p.peek())
+	}
+	return st, nil
+}
+
+func (p *parser) peek() token { return p.toks[p.pos] }
+
+func (p *parser) advance() token {
+	t := p.toks[p.pos]
+	if t.kind != tokEOF {
+		p.pos++
+	}
+	return t
+}
+
+// accept consumes the next token if it matches (case-insensitively).
+func (p *parser) accept(text string) bool {
+	t := p.peek()
+	if t.kind != tokEOF && strings.EqualFold(t.text, text) {
+		p.pos++
+		return true
+	}
+	return false
+}
+
+func (p *parser) expect(text string) error {
+	if p.accept(text) {
+		return nil
+	}
+	return fmt.Errorf("expected %q, found %s", text, p.peek())
+}
+
+func (p *parser) ident(what string) (string, error) {
+	t := p.peek()
+	if t.kind != tokIdent {
+		return "", fmt.Errorf("expected %s, found %s", what, t)
+	}
+	p.pos++
+	return t.text, nil
+}
+
+func (p *parser) statement() (Statement, error) {
+	switch {
+	case p.accept("EXPLAIN"):
+		inner, err := p.statement()
+		if err != nil {
+			return nil, err
+		}
+		return &Explain{Stmt: inner}, nil
+	case p.accept("CREATE"):
+		return p.createStatement()
+	case p.accept("DROP"):
+		if err := p.expect("TABLE"); err != nil {
+			return nil, err
+		}
+		name, err := p.ident("a table name")
+		return &DropTable{Name: name}, err
+	case p.accept("INSERT"):
+		return p.insertStatement()
+	case p.accept("SELECT"):
+		return p.selectStatement()
+	case p.accept("UPDATE"):
+		return p.updateStatement()
+	case p.accept("DELETE"):
+		return p.deleteStatement()
+	case p.accept("BEGIN"):
+		p.accept("TRANSACTION")
+		return &Begin{}, nil
+	case p.accept("COMMIT"):
+		return &Commit{}, nil
+	case p.accept("ROLLBACK"), p.accept("ABORT"):
+		return &Rollback{}, nil
+	case p.accept("CHECKPOINT"):
+		return &Checkpoint{}, nil
+	case p.accept("SHOW"):
+		if p.accept("TABLES") {
+			return &ShowTables{}, nil
+		}
+		if p.accept("STATS") {
+			return &ShowStats{}, nil
+		}
+		return nil, fmt.Errorf("expected TABLES or STATS, found %s", p.peek())
+	case p.accept("DESCRIBE"), p.accept("DESC"):
+		name, err := p.ident("a table name")
+		return &Describe{Table: name}, err
+	}
+	return nil, fmt.Errorf("unrecognized statement starting at %s", p.peek())
+}
