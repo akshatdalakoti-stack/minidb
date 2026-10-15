@@ -3,6 +3,7 @@ package query
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"minidb/db"
 	"minidb/txn"
@@ -273,4 +274,139 @@ func (s *Session) explain(st Statement) (*Result, error) {
 		msg += fmt.Sprintf("\n  then filter: %s", describeConditions(where))
 	}
 	return &Result{Message: msg, Plan: p.String()}, nil
+}
+
+func describeConditions(cs []Condition) string {
+	parts := make([]string, len(cs))
+	for i, c := range cs {
+		parts[i] = fmt.Sprintf("%s %s %s", c.Column, c.Op, c.Value)
+	}
+	return strings.Join(parts, " AND ")
+}
+
+// --- execution -------------------------------------------------------------
+
+// rowsFor gathers the rows a statement should consider, using the chosen plan.
+func (s *Session) rowsFor(t *txn.Txn, tb *db.Table, where []Condition) ([]db.ScanRow, plan, error) {
+	if err := checkConditions(tb, where); err != nil {
+		return nil, plan{}, err
+	}
+	p := choosePlan(tb, where)
+	var candidates []db.ScanRow
+
+	switch p.kind {
+	case "index lookup":
+		rows, err := s.d.IndexLookup(t, tb, p.column, p.eq)
+		if err != nil {
+			return nil, p, err
+		}
+		candidates = rows
+	case "index range":
+		lo, hi := db.Value{Null: true}, db.Value{Null: true}
+		if p.hasLo {
+			lo = p.lo
+		}
+		if p.hasHi {
+			hi = p.hi
+		}
+		err := s.d.IndexRange(t, tb, p.column, lo, hi, func(r db.ScanRow) error {
+			candidates = append(candidates, r)
+			return nil
+		})
+		if err != nil {
+			return nil, p, err
+		}
+	default:
+		err := s.d.Scan(t, tb, func(r db.ScanRow) error {
+			candidates = append(candidates, r)
+			return nil
+		})
+		if err != nil {
+			return nil, p, err
+		}
+	}
+
+	// The index narrowed things down; every condition still has to be checked,
+	// because an index range is inclusive at its edges and other columns are
+	// not covered at all.
+	out := candidates[:0]
+	for _, r := range candidates {
+		ok, err := matches(tb, r.Row, where)
+		if err != nil {
+			return nil, p, err
+		}
+		if ok {
+			out = append(out, r)
+		}
+	}
+	return out, p, nil
+}
+
+// checkConditions rejects comparisons that cannot possibly make sense, rather
+// than silently returning nothing.
+func checkConditions(tb *db.Table, where []Condition) error {
+	for _, c := range where {
+		i := tb.Def.Schema.ColumnIndex(c.Column)
+		if i < 0 {
+			return fmt.Errorf("%w: %s.%s", db.ErrNoSuchColumn, tb.Def.Name, c.Column)
+		}
+		if c.Value.Null {
+			continue
+		}
+		col := tb.Def.Schema.Columns[i]
+		if col.Type != c.Value.Type {
+			return fmt.Errorf("cannot compare %s column %q with %s", col.Type, col.Name, c.Value)
+		}
+	}
+	return nil
+}
+
+func matches(tb *db.Table, row db.Row, where []Condition) (bool, error) {
+	for _, c := range where {
+		i := tb.Def.Schema.ColumnIndex(c.Column)
+		if i < 0 {
+			return false, fmt.Errorf("%w: %s", db.ErrNoSuchColumn, c.Column)
+		}
+		v := row[i]
+		if c.Value.Null {
+			// "= NULL" is read as IS NULL here, and "!= NULL" as IS NOT NULL.
+			isNull := v.Null
+			switch c.Op {
+			case "=":
+				if !isNull {
+					return false, nil
+				}
+			case "!=":
+				if isNull {
+					return false, nil
+				}
+			default:
+				return false, nil
+			}
+			continue
+		}
+		if v.Null {
+			return false, nil // NULL compares as unknown, so the row drops out
+		}
+		cmp := v.Compare(c.Value)
+		ok := false
+		switch c.Op {
+		case "=":
+			ok = cmp == 0
+		case "!=":
+			ok = cmp != 0
+		case "<":
+			ok = cmp < 0
+		case "<=":
+			ok = cmp <= 0
+		case ">":
+			ok = cmp > 0
+		case ">=":
+			ok = cmp >= 0
+		}
+		if !ok {
+			return false, nil
+		}
+	}
+	return true, nil
 }
