@@ -170,3 +170,77 @@ find storage engine bugs:
 - one long end to end test, `TestEndToEndDefinitionOfDone`: open, create,
   insert 100,000 rows, build an index on them, do point lookups, range scans,
   updates and deletes, commit, crash, restart, recover, check everything.
+## Benchmarks
+
+```bash
+go test -bench . -benchtime 300x ./bench/
+```
+
+```bash
+go test -bench . ./storage/ ./buffer/ ./index/ ./table/ ./wal/
+```
+
+The benchmarks print the numbers that explain the timing, like buffer pool hit
+ratio and reads and writes per operation, not just ns/op.
+
+Run on an AMD Ryzen 7 7445HS, Windows, NVMe SSD, `-benchtime 300x`, a 50,000
+row table, fsync off except where it says otherwise.
+
+### With an index and without one
+
+| Operation | ns/op | ops/sec | reads/op | hit ratio |
+|---|---:|---:|---:|---:|
+| point lookup with the B+tree | 6,230 | ~161,000 | 0.19 | 0.97 |
+| point lookup with no index (full scan) | 9,215,169 | ~109 | 0 | 1.00 |
+| range scan, 1,000 rows, with the index | 1,060,771 | ~943 | 21.7 | 0.98 |
+| range scan, 1,000 rows, no index | 17,956,270 | ~56 | 0 | 1.00 |
+
+A point lookup through the tree is about 1,480 times faster than the same
+lookup without one, and the gap gets wider as the table grows. That one number
+is the whole argument for building the B+tree.
+
+### Small buffer pool and big one
+
+Same random lookup workload, over a working set that does not fit in the small
+pool:
+
+| Pool size | ns/op | hit ratio | reads/op |
+|---|---:|---:|---:|
+| 16 pages (64 KiB) | 25,562 | 0.61 | 2.34 |
+| 4,096 pages (16 MiB) | 2,883 | 1.00 | 0 |
+
+8.9 times faster, and the hit ratio column says why. A 61% hit rate means more
+than two real reads on the average lookup. A 100% hit rate means none.
+
+### The rest
+
+| Benchmark | ns/op | notes |
+|---|---:|---|
+| sequential insert, no index | 2,736 | ~366,000 rows/sec |
+| sequential insert, indexed | 4,103 | index upkeep included |
+| random insert, indexed | 6,873 | random keys ruin locality |
+| full table scan, 50,000 rows | 17,112,099 | ~2.9M rows/sec |
+| update | 3,024 | in place when it fits |
+| delete | 3,292 | heap entry plus index entry |
+| concurrent reads | 3,137 | 12 goroutines, `RunParallel` |
+| concurrent writes | 21,280 | 12 goroutines, 0 conflicts |
+| commit with fsync | 483,118 | 1.01 fsyncs per transaction |
+| commit without fsync | 9,839 | 49 times faster, and not durable |
+| recovery after a crash | n/a | 20,773 log records replayed in about 12 ms |
+
+The fsync line is the one to look at. A transaction that really waits for the
+disk costs about half a millisecond, and everything the log does, group commit,
+batching, putting off page writes, is there to spread that one fsync over as
+much work as possible.
+
+## Where it stops
+
+These are on purpose, with the reasoning in
+[DESIGN.md](DESIGN.md#what-it-does-not-do): no MVCC, so readers block writers,
+no latch crabbing in the B+tree, so index writes to one table go one at a time,
+no phantom protection, and pages emptied by a merge or a dropped table are not
+handed back to the allocator.
+
+Next things, in the order they would be worth doing: MVCC and snapshot
+isolation, latch crabbing, fuzzy checkpoints, and a planner that knows when an
+index scan is not actually the cheaper option.
