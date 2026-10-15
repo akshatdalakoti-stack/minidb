@@ -549,3 +549,80 @@ func (p *parser) updateStatement() (Statement, error) {
 	}
 	return st, nil
 }
+
+func (p *parser) deleteStatement() (Statement, error) {
+	if err := p.expect("FROM"); err != nil {
+		return nil, err
+	}
+	tbl, err := p.ident("a table name")
+	if err != nil {
+		return nil, err
+	}
+	st := &Delete{Table: tbl}
+	if p.accept("WHERE") {
+		st.Where, err = p.whereClause()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return st, nil
+}
+
+// whereClause parses conditions joined by AND. OR is not supported: it would
+// need a real expression tree and a planner that can union index scans, which
+// is beyond what this layer is for.
+func (p *parser) whereClause() ([]Condition, error) {
+	var out []Condition
+	for {
+		col, err := p.ident("a column name")
+		if err != nil {
+			return nil, err
+		}
+		op := p.advance()
+		if op.kind != tokPunct || !isComparison(op.text) {
+			return nil, fmt.Errorf("expected a comparison operator, found %s", op)
+		}
+		v, err := p.value()
+		if err != nil {
+			return nil, err
+		}
+		normalized := op.text
+		if normalized == "<>" {
+			normalized = "!="
+		}
+		out = append(out, Condition{Column: col, Op: normalized, Value: v})
+		if p.accept("AND") {
+			continue
+		}
+		break
+	}
+	return out, nil
+}
+
+func isComparison(s string) bool {
+	switch s {
+	case "=", "!=", "<>", "<", "<=", ">", ">=":
+		return true
+	}
+	return false
+}
+
+func (p *parser) value() (db.Value, error) {
+	t := p.peek()
+	switch {
+	case t.kind == tokNumber:
+		p.pos++
+		n, err := strconv.ParseInt(t.text, 10, 64)
+		if err != nil {
+			return db.Value{}, fmt.Errorf("bad number %q", t.text)
+		}
+		return db.IntValue(n), nil
+	case t.kind == tokString:
+		p.pos++
+		return db.TextValue(t.text), nil
+	case t.kind == tokIdent && strings.EqualFold(t.text, "NULL"):
+		p.pos++
+		return db.Value{Null: true}, nil
+	}
+	return db.Value{}, fmt.Errorf("expected a value, found %s", t)
+}
