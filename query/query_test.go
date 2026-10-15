@@ -230,3 +230,93 @@ func TestExplicitTransactions(t *testing.T) {
 		t.Fatalf("second session sees %d rows", len(res.Rows))
 	}
 }
+
+func TestSQLSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	opts := db.DefaultOptions()
+	opts.PoolSize = 32
+
+	d, err := db.Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewSession(d)
+	exec(t, s, "CREATE TABLE kv (k INT, v TEXT)")
+	exec(t, s, "CREATE INDEX kv_k ON kv (k)")
+	for i := 0; i < 200; i++ {
+		exec(t, s, "INSERT INTO kv VALUES ("+itoa(i)+", 'value-"+itoa(i)+"')")
+	}
+	s.Close()
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	d2, err := db.Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d2.Close()
+	s2 := NewSession(d2)
+	defer s2.Close()
+
+	res := exec(t, s2, "SELECT v FROM kv WHERE k = 199")
+	if len(res.Rows) != 1 || res.Rows[0][0].Text != "value-199" {
+		t.Fatalf("data did not survive the restart:\n%s", res)
+	}
+	res = exec(t, s2, "SHOW TABLES")
+	if len(res.Rows) != 1 || res.Rows[0][0].Text != "kv" {
+		t.Fatalf("catalog did not survive:\n%s", res)
+	}
+	res = exec(t, s2, "DESCRIBE kv")
+	if len(res.Rows) != 2 || res.Rows[0][2].Text != "kv_k" {
+		t.Fatalf("index metadata did not survive:\n%s", res)
+	}
+}
+
+func TestSQLRecoveryAfterCrash(t *testing.T) {
+	dir := t.TempDir()
+	opts := db.DefaultOptions()
+	opts.PoolSize = 32
+
+	d, err := db.Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewSession(d)
+	exec(t, s, "CREATE TABLE kv (k INT, v TEXT)")
+	exec(t, s, "INSERT INTO kv VALUES (1, 'committed')")
+	exec(t, s, "BEGIN")
+	exec(t, s, "INSERT INTO kv VALUES (2, 'never-committed')")
+	d.SimulateCrash()
+
+	d2, err := db.Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d2.Close()
+	s2 := NewSession(d2)
+	defer s2.Close()
+	res := exec(t, s2, "SELECT v FROM kv")
+	if len(res.Rows) != 1 || res.Rows[0][0].Text != "committed" {
+		t.Fatalf("recovery produced the wrong table:\n%s\n%v", res, d2.Report())
+	}
+}
+
+func itoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	var b []byte
+	neg := i < 0
+	if neg {
+		i = -i
+	}
+	for i > 0 {
+		b = append([]byte{byte('0' + i%10)}, b...)
+		i /= 10
+	}
+	if neg {
+		b = append([]byte{'-'}, b...)
+	}
+	return string(b)
+}
