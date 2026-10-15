@@ -924,3 +924,143 @@ func TestHundredGoroutines(t *testing.T) {
 }
 
 // --- the "definition of done" walkthrough ---------------------------------
+
+func TestEndToEndDefinitionOfDone(t *testing.T) {
+	if testing.Short() {
+		t.Skip("long end to end test")
+	}
+	dir := t.TempDir()
+	opts := testOptions()
+	opts.PoolSize = 256
+	opts.NoSync = true // keep the test quick; the crash still drops the pool
+	d, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create table, insert 100k records.
+	tb, err := d.CreateTable("users", usersSchema())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 100000
+	start := time.Now()
+	if err := d.Update(func(tx *txn.Txn) error {
+		for i := 0; i < n; i++ {
+			if _, err := d.Insert(tx, tb, userRow(i)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("inserted %d rows in %s", n, time.Since(start))
+
+	// Build the index afterwards, over existing data.
+	start = time.Now()
+	tb, err = d.CreateIndex("users", "users_by_id", "id", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("built the index in %s", time.Since(start))
+
+	// Point lookups and range scans.
+	if err := d.View(func(tx *txn.Txn) error {
+		for _, id := range []int64{0, 1, 50000, n - 1} {
+			rows, err := d.IndexLookup(tx, tb, "id", IntValue(id))
+			if err != nil {
+				return err
+			}
+			if len(rows) != 1 {
+				return fmt.Errorf("point lookup %d returned %d rows", id, len(rows))
+			}
+		}
+		count := 0
+		if err := d.IndexRange(tx, tb, "id", IntValue(1000), IntValue(1999), func(ScanRow) error {
+			count++
+			return nil
+		}); err != nil {
+			return err
+		}
+		if count != 1000 {
+			return fmt.Errorf("range scan returned %d rows", count)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Updates and deletes inside one committed transaction.
+	var updatedRID storage.RID
+	if err := d.Update(func(tx *txn.Txn) error {
+		rows, err := d.IndexLookup(tx, tb, "id", IntValue(1234))
+		if err != nil {
+			return err
+		}
+		row := rows[0].Row
+		row[1] = TextValue("updated-before-the-crash")
+		updatedRID, err = d.UpdateRow(tx, tb, rows[0].RID, row)
+		if err != nil {
+			return err
+		}
+		del, err := d.IndexLookup(tx, tb, "id", IntValue(4321))
+		if err != nil {
+			return err
+		}
+		return d.DeleteRow(tx, tb, del[0].RID)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// An uncommitted transaction that the crash will eat.
+	loser, _ := d.Begin()
+	if _, err := d.Insert(loser, tb, Row{IntValue(-1), TextValue("never-committed"), IntValue(0)}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Crash the process.
+	d.SimulateCrash()
+
+	// Restart: recovery runs during Open.
+	d2, err := Open(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d2.Close()
+	t.Log(d2.Report())
+
+	tb2, err := d2.Table("users")
+	if err != nil {
+		t.Fatal(err)
+	}
+	count, err := d2.Count(tb2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != n-1 {
+		t.Fatalf("after recovery the table holds %d rows, want %d", count, n-1)
+	}
+	if err := d2.View(func(tx *txn.Txn) error {
+		row, err := d2.Get(tx, tb2, updatedRID)
+		if err != nil {
+			return err
+		}
+		if row[1].Text != "updated-before-the-crash" {
+			return fmt.Errorf("committed update was lost: %v", row[1])
+		}
+		if rows, err := d2.IndexLookup(tx, tb2, "id", IntValue(4321)); err != nil || len(rows) != 0 {
+			return fmt.Errorf("committed delete was lost: %v %v", rows, err)
+		}
+		if rows, err := d2.IndexLookup(tx, tb2, "id", IntValue(-1)); err != nil || len(rows) != 0 {
+			return fmt.Errorf("uncommitted insert survived: %v %v", rows, err)
+		}
+		if rows, err := d2.IndexLookup(tx, tb2, "id", IntValue(99999)); err != nil || len(rows) != 1 {
+			return fmt.Errorf("committed row missing after recovery: %v %v", rows, err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Log(d2.Stats())
+}
