@@ -154,3 +154,123 @@ func (s *Session) Run(st Statement) (*Result, error) {
 	}
 	return nil, fmt.Errorf("unsupported statement %T", st)
 }
+
+// withTxn runs fn in the session's transaction, or in a fresh autocommit one.
+func (s *Session) withTxn(fn func(*txn.Txn) (*Result, error)) (*Result, error) {
+	if s.tx != nil {
+		res, err := fn(s.tx)
+		if err != nil {
+			// The statement failed inside an explicit transaction. Leave the
+			// transaction open: it is the user's decision whether to retry or
+			// roll back - except when the engine already doomed it.
+			if s.tx.Aborting() {
+				t := s.tx
+				s.tx = nil
+				s.d.Abort(t)
+				return nil, fmt.Errorf("%w (transaction rolled back)", err)
+			}
+		}
+		return res, err
+	}
+	t, err := s.d.Begin()
+	if err != nil {
+		return nil, err
+	}
+	res, err := fn(t)
+	if err != nil {
+		s.d.Abort(t)
+		return nil, err
+	}
+	if err := s.d.Commit(t); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// --- planning --------------------------------------------------------------
+
+// plan describes how a statement will find its rows. This is the entire query
+// optimizer: pick an index if one of the conditions can use it, otherwise scan.
+type plan struct {
+	kind    string // "seq scan", "index lookup", "index range"
+	column  string
+	index   string
+	eq      db.Value
+	lo, hi  db.Value
+	hasLo   bool
+	hasHi   bool
+	filters []Condition
+}
+
+func (p plan) String() string {
+	switch p.kind {
+	case "index lookup":
+		return fmt.Sprintf("index lookup on %s (%s = %s)", p.index, p.column, p.eq)
+	case "index range":
+		lo, hi := "-inf", "+inf"
+		if p.hasLo {
+			lo = p.lo.String()
+		}
+		if p.hasHi {
+			hi = p.hi.String()
+		}
+		return fmt.Sprintf("index range scan on %s (%s in [%s, %s])", p.index, p.column, lo, hi)
+	}
+	return "sequential scan (no usable index)"
+}
+
+// choosePlan looks for a condition that an index can answer.
+func choosePlan(tb *db.Table, where []Condition) plan {
+	p := plan{kind: "seq scan", filters: where}
+	for _, c := range where {
+		_, def, ok := tb.IndexOn(c.Column)
+		if !ok {
+			continue
+		}
+		switch c.Op {
+		case "=":
+			// Equality beats everything: one descent, no scan.
+			return plan{kind: "index lookup", column: c.Column, index: def.Name, eq: c.Value, filters: where}
+		case "<", "<=", ">", ">=":
+			if p.kind == "seq scan" {
+				p = plan{kind: "index range", column: c.Column, index: def.Name, filters: where}
+			}
+			if p.column != c.Column {
+				continue
+			}
+			// Both bounds on the same column collapse into one range.
+			switch c.Op {
+			case ">", ">=":
+				p.lo, p.hasLo = c.Value, true
+			case "<", "<=":
+				p.hi, p.hasHi = c.Value, true
+			}
+		}
+	}
+	return p
+}
+
+func (s *Session) explain(st Statement) (*Result, error) {
+	var tableName string
+	var where []Condition
+	switch v := st.(type) {
+	case *Select:
+		tableName, where = v.Table, v.Where
+	case *Update:
+		tableName, where = v.Table, v.Where
+	case *Delete:
+		tableName, where = v.Table, v.Where
+	default:
+		return &Result{Message: "no plan: this statement does not read rows"}, nil
+	}
+	tb, err := s.d.Table(tableName)
+	if err != nil {
+		return nil, err
+	}
+	p := choosePlan(tb, where)
+	msg := fmt.Sprintf("%s on %s", p.String(), tableName)
+	if len(where) > 0 {
+		msg += fmt.Sprintf("\n  then filter: %s", describeConditions(where))
+	}
+	return &Result{Message: msg, Plan: p.String()}, nil
+}
