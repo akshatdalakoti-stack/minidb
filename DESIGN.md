@@ -234,3 +234,120 @@ grew the file and then aborted would unlink the page while rolling back,
 cutting other transactions' committed rows out of the table. Growing the file
 is not one transaction's private business. Now an aborted transaction just
 leaves an empty page behind, which costs space and nothing else.
+## Recovery
+
+Three passes, the usual ARIES shape:
+
+| Pass | Reads | Gives you |
+|---|---|---|
+| analysis | forward from the last checkpoint | which transactions were still running, where the log ends |
+| redo | forward from the same spot | a data file identical to the moment of the crash, losers included |
+| undo | backwards along each loser's PrevLSN chain | losers rolled back, with compensation records written as it goes |
+
+Redoing work that is about to be undone looks like a waste, but repeating
+history first makes everything after it simple. Once every page is back the way
+it was, undo can use the same code as a normal rollback, and a normal rollback
+can use the same code as recovery. One path, tested three ways.
+
+Every undo writes a compensation record with an UndoNext pointer saying where
+the rollback carries on from. If the process dies during recovery, the next
+attempt picks up from those records instead of undoing anything twice.
+Compensation records are redo only and are never undone themselves.
+
+One ordering detail that took a while to get right: a logical index undo writes
+its compensation record after the tree work is done, not before. If the process
+dies in between, the undo just runs again, and deleting an entry that is not
+there and inserting one that already exists are both no-ops. Writing the record
+first would claim the undo had happened when it had only half happened.
+
+What happens if it dies at each bad moment:
+
+| Crash point | What happens |
+|---|---|
+| after the log append, before the page changes | redo applies it, the log always leads |
+| after the page changes, before commit | redo applies it, then undo rolls it back |
+| after the commit record is fsynced | redo replays everything, the commit holds even if no data page ever reached disk |
+| in the middle of a page write | the checksum fails and the page is refused instead of trusted |
+| in the middle of a log append | the torn tail is cut on open, nobody was told those records were durable |
+| while growing the data file | the partial page is cut off, recovery grows the file back |
+| during a rollback | compensation records say what was already undone, recovery resumes from UndoNext |
+| during recovery itself | redo is safe to repeat and undo resumes from its own records, so run it as often as you like |
+
+Checkpoints are sharp ones: write a begin marker, flush every dirty page, note
+which transactions are still running. Recovery can then start at that marker,
+because everything logged before it is already in the data file. A fuzzy
+checkpoint would get in writers' way even less, but this one keeps recovery
+short and is much easier to be sure about.
+
+## Transactions and locking
+
+Strict 2PL. Locks are taken when they are needed and held until commit or
+abort, never dropped early. That is not a style choice here. Undo puts old
+bytes back, so no other transaction can be allowed to see or overwrite an
+uncommitted value before the rollback gets its turn. What falls out is close to
+serializable for the operations supported, except for phantoms, since there are
+no range locks.
+
+Deadlocks are detected, not prevented. When a transaction is about to block,
+its edges go into a wait-for graph and a DFS looks for a cycle. If there is
+one, the youngest transaction in the cycle is aborted, because it has done the
+least work, and picking by age means something always makes progress instead of
+everyone retrying forever. Building the graph only when somebody blocks costs
+nothing in the normal case where nobody does. A lock timeout sits behind the
+detector as a backstop.
+
+Transaction state and rollback live in different packages. txn owns ids,
+states, undo chain heads and locks, and has no idea how to reverse a page
+change, since that needs the buffer pool and the index. So db hands itself to
+txn as an Undoer. That keeps the imports going one way and lets the lock
+manager be tested on its own.
+
+## Locking levels
+
+From the bottom up:
+
+| Level | What it uses | What it protects |
+|---|---|---|
+| frame | one RWMutex per frame | one page's bytes while it is read or written |
+| pool | one mutex | the frame table, free list and replacer |
+| heap | one mutex | the tail pointer and free space hints, held across a file grow so two writers cannot orphan each other's page |
+| index | one RWMutex per tree | the shape of the tree |
+| rows | the lock manager, 2PL | isolation between transactions |
+
+Two rules keep this from deadlocking: never take a frame lock while holding the
+pool mutex, and never take the heap mutex while holding a frame lock.
+
+## Query layer
+
+A hand written lexer and a recursive descent parser. No parser generator, no
+SQL library. The planner is one function: if a WHERE condition is on an indexed
+column, use the index, equality for a lookup and inequality for a range scan,
+otherwise scan the table. EXPLAIN prints what it picked, which is the easiest
+way to watch the index earn its keep without reading benchmark output.
+
+UPDATE and DELETE collect their target rows before changing anything. Changing
+rows while an index scan is still open would let the same row turn up twice,
+once under its old key and once under the new one. That is the Halloween
+problem and it is easy to walk into.
+
+## What it does not do
+
+Writing these down because a limitation you can name is a decision, and one you
+cannot is a bug.
+
+1. Pages emptied by a B+tree merge or a dropped table are not reused. Giving a
+   page back to the allocator while log records that mention it might still be
+   replayed needs allocation logging and an ownership check at redo time. For
+   now those pages sit there unreachable. Wasted space, never corruption.
+2. No latch crabbing in the B+tree, so index writes to one table serialize.
+3. A crash inside a split can leave an index needing a rebuild. The heap is
+   always correct.
+4. No phantom protection. There are no range or gap locks, so the same range
+   query inside one transaction can pick up rows somebody else inserted.
+5. No MVCC. Readers block writers and writers block readers. Snapshot
+   isolation is the obvious next step and would take most of the contention
+   away.
+6. The catalog is read once and kept in memory, so two processes doing DDL at
+   the same time is not supported. One process owns a database.
+7. ORDER BY always sorts in memory, even when the index it just used already
+   produced that order.
