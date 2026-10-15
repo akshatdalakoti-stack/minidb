@@ -63,3 +63,110 @@ query/      lexer, parser, planner, executor
 bench/      engine level benchmarks
 cmd/minidb/ the shell
 ```
+## Trying it
+
+```bash
+go build ./cmd/minidb
+```
+
+```bash
+./minidb -db ./mydb
+```
+
+```
+minidb> CREATE TABLE users (id INT, name TEXT, age INT);
+created table users
+minidb> INSERT INTO users VALUES (1,'alice',30), (2,'bob',25), (3,'carol',41);
+inserted 3 row(s)
+minidb> CREATE INDEX users_age ON users (age);
+created index users_age on users(age)
+minidb> EXPLAIN SELECT name FROM users WHERE age > 28;
+index range scan on users_age (age in [28, +inf]) on users
+  then filter: age > 28
+minidb> SELECT name, age FROM users WHERE age > 28 ORDER BY age DESC;
+name  | age
+------+----
+carol | 41
+alice | 30
+(2 row(s))
+```
+
+Transactions are there when you ask for them and automatic when you do not:
+
+```
+minidb> BEGIN;
+minidb*> DELETE FROM users WHERE age < 30;
+deleted 1 row(s)
+minidb*> ROLLBACK;
+minidb> SELECT * FROM users;   -- bob is back
+```
+
+Other ways in:
+
+```bash
+./minidb -db ./mydb -e "SELECT * FROM users"
+```
+
+```bash
+./minidb -db ./mydb -f script.sql
+```
+
+Dot commands in the shell: `.help`, `.tables`, `.stats`, `.recovery`,
+`.checkpoint`, `.timing`, `.exit`.
+
+## Using it as a library
+
+```go
+d, err := db.Open("./mydb", db.DefaultOptions())
+defer d.Close()
+
+tb, _ := d.CreateTable("users", db.Schema{Columns: []db.Column{
+    {Name: "id", Type: db.TypeInt},
+    {Name: "name", Type: db.TypeText},
+}})
+d.CreateIndex("users", "users_id", "id", true)
+
+err = d.Update(func(t *txn.Txn) error {         // commits, or rolls back on error
+    _, err := d.Insert(t, tb, db.Row{db.IntValue(1), db.TextValue("alice")})
+    return err
+})
+
+d.View(func(t *txn.Txn) error {
+    rows, err := d.IndexLookup(t, tb, "id", db.IntValue(1))
+    fmt.Println(rows, err)
+    return err
+})
+```
+
+## Tests
+
+```bash
+go test ./...
+```
+
+```bash
+go test -race ./...
+```
+
+Each part got its tests before the next part was built on top of it. Besides
+the normal per operation unit tests, there are the kinds of tests that actually
+find storage engine bugs:
+
+- model tests. 20,000 random operations against a slotted page compared with a
+  plain `map[slot][]byte`, and 6,000 mixed B+tree inserts and deletes compared
+  with a model, checking the tree's shape as it goes: keys sorted, separators
+  matching their subtrees, every leaf at the same depth, leaf chain joined up
+  and in order.
+- corruption tests. Flip a bit on disk behind the engine's back and check the
+  page gets refused instead of trusted. Cut the log in the middle of a record
+  and check the tail is trimmed and the log still works.
+- crash tests. `SimulateCrash()` throws away the buffer pool and the unflushed
+  log tail, which is what a power cut does. The tests then check that committed
+  work comes back, uncommitted work does not, the heap and the index agree
+  afterwards, and recovering twice gives the same answer as recovering once.
+- concurrency tests. 100 plus goroutines inserting, updating and reading at the
+  same time under `-race`, then checking no pins leaked and no row went
+  missing.
+- one long end to end test, `TestEndToEndDefinitionOfDone`: open, create,
+  insert 100,000 rows, build an index on them, do point lookups, range scans,
+  updates and deletes, commit, crash, restart, recover, check everything.
