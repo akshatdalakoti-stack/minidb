@@ -1,0 +1,135 @@
+// Package query implements Phase 11: a small SQL front end.
+//
+// It is deliberately hand written - no parser generator, no SQL library - and
+// deliberately small. The point of this layer is not to be SQL, it is to show
+// that the storage engine underneath can be driven by one: statements turn
+// into calls on transactions, heap files and B+trees, and the planner has to
+// decide whether an index is worth using.
+//
+//	SQL text -> lexer -> tokens -> parser -> AST -> executor -> engine
+package query
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+	"unicode"
+)
+
+// --- lexer -----------------------------------------------------------------
+
+type tokenKind int
+
+const (
+	tokEOF tokenKind = iota
+	tokIdent
+	tokNumber
+	tokString
+	tokPunct
+)
+
+type token struct {
+	kind tokenKind
+	text string
+	pos  int
+}
+
+func (t token) String() string {
+	if t.kind == tokEOF {
+		return "end of input"
+	}
+	return strconv.Quote(t.text)
+}
+
+type lexer struct {
+	src string
+	pos int
+}
+
+func (l *lexer) next() (token, error) {
+	for l.pos < len(l.src) && unicode.IsSpace(rune(l.src[l.pos])) {
+		l.pos++
+	}
+	// Line comments.
+	if strings.HasPrefix(l.src[l.pos:], "--") {
+		for l.pos < len(l.src) && l.src[l.pos] != '\n' {
+			l.pos++
+		}
+		return l.next()
+	}
+	if l.pos >= len(l.src) {
+		return token{kind: tokEOF, pos: l.pos}, nil
+	}
+	start := l.pos
+	c := l.src[l.pos]
+
+	switch {
+	case isIdentStart(c):
+		for l.pos < len(l.src) && isIdentPart(l.src[l.pos]) {
+			l.pos++
+		}
+		return token{tokIdent, l.src[start:l.pos], start}, nil
+
+	case c >= '0' && c <= '9', c == '-' && l.pos+1 < len(l.src) && isDigit(l.src[l.pos+1]):
+		l.pos++
+		for l.pos < len(l.src) && isDigit(l.src[l.pos]) {
+			l.pos++
+		}
+		return token{tokNumber, l.src[start:l.pos], start}, nil
+
+	case c == '\'', c == '"':
+		quote := c
+		l.pos++
+		var sb strings.Builder
+		for {
+			if l.pos >= len(l.src) {
+				return token{}, fmt.Errorf("unterminated string starting at position %d", start)
+			}
+			ch := l.src[l.pos]
+			if ch == quote {
+				// '' inside a string is an escaped quote.
+				if l.pos+1 < len(l.src) && l.src[l.pos+1] == quote {
+					sb.WriteByte(quote)
+					l.pos += 2
+					continue
+				}
+				l.pos++
+				break
+			}
+			sb.WriteByte(ch)
+			l.pos++
+		}
+		return token{tokString, sb.String(), start}, nil
+	}
+
+	// Two character operators first.
+	for _, op := range []string{"<=", ">=", "!=", "<>"} {
+		if strings.HasPrefix(l.src[l.pos:], op) {
+			l.pos += 2
+			return token{tokPunct, op, start}, nil
+		}
+	}
+	l.pos++
+	return token{tokPunct, string(c), start}, nil
+}
+
+func isDigit(c byte) bool      { return c >= '0' && c <= '9' }
+func isIdentStart(c byte) bool { return c == '_' || unicode.IsLetter(rune(c)) }
+func isIdentPart(c byte) bool  { return isIdentStart(c) || isDigit(c) }
+
+func tokenize(src string) ([]token, error) {
+	l := &lexer{src: src}
+	var out []token
+	for {
+		t, err := l.next()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+		if t.kind == tokEOF {
+			return out, nil
+		}
+	}
+}
+
+// --- AST -------------------------------------------------------------------
