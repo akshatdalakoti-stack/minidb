@@ -1,6 +1,7 @@
 package query
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -155,5 +156,77 @@ func TestEndToEndSQL(t *testing.T) {
 	}
 	if _, err := s.Exec("SELECT * FROM nosuchtable"); err == nil {
 		t.Fatal("unknown table accepted")
+	}
+}
+
+func TestIndexIsUsedWhenAvailable(t *testing.T) {
+	s, _ := newSession(t)
+	exec(t, s, "CREATE TABLE users (id INT, name TEXT)")
+	for i := 0; i < 100; i++ {
+		exec(t, s, "INSERT INTO users VALUES ("+itoa(i)+", 'n')")
+	}
+	// Without an index the planner has no choice.
+	res := exec(t, s, "EXPLAIN SELECT * FROM users WHERE id = 42")
+	if !strings.Contains(res.Message, "sequential scan") {
+		t.Fatalf("expected a seq scan plan, got %q", res.Message)
+	}
+	exec(t, s, "CREATE INDEX users_id ON users (id)")
+	res = exec(t, s, "EXPLAIN SELECT * FROM users WHERE id = 42")
+	if !strings.Contains(res.Message, "index lookup") {
+		t.Fatalf("index not used after CREATE INDEX: %q", res.Message)
+	}
+	res = exec(t, s, "EXPLAIN SELECT * FROM users WHERE id > 10 AND id < 20")
+	if !strings.Contains(res.Message, "index range") {
+		t.Fatalf("range not planned as an index range: %q", res.Message)
+	}
+	// And the answers agree with the unindexed ones.
+	res = exec(t, s, "SELECT id FROM users WHERE id > 10 AND id < 20")
+	if len(res.Rows) != 9 {
+		t.Fatalf("index range returned %d rows, want 9:\n%s", len(res.Rows), res)
+	}
+	res = exec(t, s, "SELECT id FROM users WHERE id = 42")
+	if len(res.Rows) != 1 || res.Rows[0][0].Int != 42 {
+		t.Fatalf("index lookup wrong:\n%s", res)
+	}
+	// A condition on an unindexed column still works, via a scan.
+	res = exec(t, s, "SELECT id FROM users WHERE name = 'n' AND id = 7")
+	if len(res.Rows) != 1 {
+		t.Fatalf("mixed conditions:\n%s", res)
+	}
+}
+
+func TestExplicitTransactions(t *testing.T) {
+	s, d := newSession(t)
+	exec(t, s, "CREATE TABLE t (id INT)")
+	exec(t, s, "BEGIN")
+	exec(t, s, "INSERT INTO t VALUES (1)")
+	exec(t, s, "INSERT INTO t VALUES (2)")
+	if !s.InTransaction() {
+		t.Fatal("session should be in a transaction")
+	}
+	exec(t, s, "ROLLBACK")
+
+	res := exec(t, s, "SELECT * FROM t")
+	if len(res.Rows) != 0 {
+		t.Fatalf("rollback did not undo the inserts:\n%s", res)
+	}
+
+	exec(t, s, "BEGIN")
+	exec(t, s, "INSERT INTO t VALUES (3)")
+	exec(t, s, "COMMIT")
+	res = exec(t, s, "SELECT * FROM t")
+	if len(res.Rows) != 1 || res.Rows[0][0].Int != 3 {
+		t.Fatalf("commit lost the insert:\n%s", res)
+	}
+
+	if _, err := s.Exec("COMMIT"); err == nil {
+		t.Fatal("COMMIT outside a transaction was accepted")
+	}
+	// A second session sees the committed row.
+	s2 := NewSession(d)
+	defer s2.Close()
+	res = exec(t, s2, "SELECT * FROM t")
+	if len(res.Rows) != 1 {
+		t.Fatalf("second session sees %d rows", len(res.Rows))
 	}
 }
