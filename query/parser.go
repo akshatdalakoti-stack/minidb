@@ -456,3 +456,96 @@ func (p *parser) insertStatement() (Statement, error) {
 	}
 	return st, nil
 }
+
+func (p *parser) selectStatement() (Statement, error) {
+	st := &Select{Limit: -1}
+	if !p.accept("*") {
+		for {
+			col, err := p.ident("a column name")
+			if err != nil {
+				return nil, err
+			}
+			st.Columns = append(st.Columns, col)
+			if p.accept(",") {
+				continue
+			}
+			break
+		}
+	}
+	if err := p.expect("FROM"); err != nil {
+		return nil, err
+	}
+	tbl, err := p.ident("a table name")
+	if err != nil {
+		return nil, err
+	}
+	st.Table = tbl
+	if p.accept("WHERE") {
+		st.Where, err = p.whereClause()
+		if err != nil {
+			return nil, err
+		}
+	}
+	if p.accept("ORDER") {
+		if err := p.expect("BY"); err != nil {
+			return nil, err
+		}
+		st.OrderBy, err = p.ident("a column name")
+		if err != nil {
+			return nil, err
+		}
+		if p.accept("DESC") {
+			st.Desc = true
+		} else {
+			p.accept("ASC")
+		}
+	}
+	if p.accept("LIMIT") {
+		t := p.advance()
+		if t.kind != tokNumber {
+			return nil, fmt.Errorf("LIMIT needs a number, found %s", t)
+		}
+		n, err := strconv.Atoi(t.text)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("bad LIMIT %q", t.text)
+		}
+		st.Limit = n
+	}
+	return st, nil
+}
+
+func (p *parser) updateStatement() (Statement, error) {
+	tbl, err := p.ident("a table name")
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expect("SET"); err != nil {
+		return nil, err
+	}
+	st := &Update{Table: tbl}
+	for {
+		col, err := p.ident("a column name")
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expect("="); err != nil {
+			return nil, err
+		}
+		v, err := p.value()
+		if err != nil {
+			return nil, err
+		}
+		st.Sets = append(st.Sets, Assignment{Column: col, Value: v})
+		if p.accept(",") {
+			continue
+		}
+		break
+	}
+	if p.accept("WHERE") {
+		st.Where, err = p.whereClause()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return st, nil
+}
